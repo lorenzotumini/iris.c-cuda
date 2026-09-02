@@ -34,7 +34,7 @@ help:
 	@echo "Choose a backend:"
 	@echo "  make generic  - Pure C, no dependencies (slow)"
 	@echo "  make blas     - With BLAS acceleration (~30x faster)"
-	@echo "  make cuda     - NVIDIA GPU with CUDA acceleration (fastest on Linux)"
+	@echo "  make cuda     - NVIDIA GPU (CUDA toolkit + OpenBLAS required)"
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest on Mac)"
@@ -48,7 +48,15 @@ endif
 	@echo "  make info     - Show build configuration"
 	@echo "  make lib      - Build static library"
 	@echo ""
+ifeq ($(UNAME_S),Darwin)
+ifeq ($(UNAME_M),arm64)
 	@echo "Example: make mps && ./iris -d flux-klein-4b -p \"a cat\" -o cat.png"
+else
+	@echo "Example: make blas && ./iris -d flux-klein-4b -p \"a cat\" -o cat.png"
+endif
+else
+	@echo "Example: make cuda && ./iris -d flux-klein-4b -p \"a cat\" -o cat.png"
+endif
 
 # =============================================================================
 # Backend: generic (pure C, no BLAS)
@@ -198,6 +206,7 @@ ifeq ($(UNAME_M),arm64)
 	@echo "  mps     - Metal GPU (recommended)"
 endif
 else
+	@echo "  cuda    - NVIDIA CUDA (requires CUDA toolkit and OpenBLAS)"
 	@echo "  blas    - OpenBLAS (requires libopenblas-dev)"
 endif
 

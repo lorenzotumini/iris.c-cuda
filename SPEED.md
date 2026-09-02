@@ -1,4 +1,8 @@
-# MPS Speed Optimization Log
+# Backend Speed Optimization Log
+
+This file records measured optimization work. The original sections document
+the Apple MPS backend; the CUDA port and its later optimization pass are
+documented separately below.
 
 ## Guidelines
 - Complexity increase must be justified by speed results
@@ -9,8 +13,8 @@
 - **Before committing**: run `make test` to verify no regressions
 - **Benchmark command**:
   ```bash
-  ./flux -d flux-klein-4b -p "A woman wearing sunglasses" -o /tmp/bench.png -W 256 -H 256 -v --seed 42
-  ./flux -d flux-klein-4b -p "A woman wearing sunglasses" -o /tmp/bench.png -W 512 -H 512 -v --seed 42
+  ./iris -d flux-klein-4b -p "A woman wearing sunglasses" -o /tmp/bench.png -W 256 -H 256 -v --seed 42
+  ./iris -d flux-klein-4b -p "A woman wearing sunglasses" -o /tmp/bench.png -W 512 -H 512 -v --seed 42
   ```
 
 ## Pipeline
@@ -22,7 +26,7 @@
 4. VAE Decode:       latents -> VAE decoder -> RGB image
 ```
 
-## Current Baseline (2026-02-06 / MacBook Pro M3 Max 40-core GPU, 128 GB, 400 GB/s)
+## MPS Baseline (2026-02-06 / MacBook Pro M3 Max 40-core GPU, 128 GB, 400 GB/s)
 
 ### 256x256 (seq=256+512=768 tokens)
 - Text encoding: 1.0s (Qwen3, GPU-resident forward, was 1.9s)
@@ -44,7 +48,7 @@
 - Step 1 ~15% slower than subsequent steps (residual MPS warmup)
 - Matmul compute dominates (~4.5 TFLOPS for these dimensions)
 
-## Already Optimized
+## MPS Already Optimized
 - Batched GPU ops within each block (batch_begin/batch_end)
 - Fused QKV+MLP projection in single blocks
 - Fused bf16 attention kernel (seq <= 1024)
@@ -55,7 +59,7 @@
 - GPU-resident Qwen3 text encoder (1 sync for 27 layers)
 - GPU-resident VAE decoder (f32 group_norm/swish/add/upsample on GPU)
 
-## Optimization Attempts
+## MPS Optimization Attempts
 
 ### Attempt 1: Pre-warm bf16 weight buffer cache (SUCCESS)
 - In mmap mode, first denoising step paid ~800ms overhead to copy ~7GB of bf16 weight data
@@ -154,7 +158,7 @@
 - **Result: 256x256 VAE 0.4s → 0.2s (50% faster), 512x512 VAE 1.6s → 0.5s (69% faster)**
 - **End-to-end: 256x256 5.4s → 5.2s, 512x512 8.6s → 7.5s (13% faster)**
 
-### Next targets
+### MPS next targets
 - **Text encoder (Qwen3)**: now 1.0s — theoretical ~430ms. Bottleneck is cache fill + GPU overlap.
 - **VAE decoder**: now 0.2s/0.5s — mid-block attention still on CPU (~50ms at 512x512)
   - Could move attention to GPU for small additional gain
@@ -165,6 +169,48 @@
 - **img2img with `-i`**: adds reference image tokens, further increases sequence length
 - **Step 1 warmup**: ~15% slower than subsequent steps (residual MPS JIT)
   - Already tried JIT pre-warming (Attempt 1b), didn't help
+
+## CUDA Baseline (2026-09-02 / RTX 3070 Ti 8 GB, Ampere `sm_86`)
+
+Configuration: Flux 4B distilled, mmap mode, four steps, seed 42, prompt
+`A woman wearing sunglasses`, warm filesystem cache. Times include loading,
+text encoding, denoising, VAE decode, and saving.
+
+| Size | Total | Denoising | VAE decode |
+|------|------:|----------:|-----------:|
+| 256x256 | 3.7s | 2.61s | 0.1s |
+| 512x512 | 4.5s | 3.27s | 0.3s |
+| 1024x1024 | 9.8s | 7.78s | 1.0s |
+
+At 512x512, step 1 takes about 935ms and subsequent steps take 773-785ms
+after the bounded weight cache is populated. A four-step 1024x1024 run sampled
+about 3.6 GiB of process VRAM during denoising.
+
+### CUDA optimizations
+
+- Native BF16 transformer weights and activations with FP32 attention logits/softmax.
+- Direct strided-batched cuBLAS attention over token-major, head-interleaved Q/K/V; no explicit head transposes.
+- 384 MiB query-tiled attention workspace. This replaced the old 2 GiB score limit and slow scalar fallback at high resolutions.
+- GPU-resident Qwen3 forward pass, computing only layers required for output extraction.
+- GPU-resident VAE decoder including bottleneck attention.
+- TF32 VAE convolution using direct 1x1 GEMM or a bounded 128 MiB im2col tile.
+- Stream-ordered allocation through `cudaMallocAsync`/`cudaFreeAsync` with a compatibility fallback.
+- Bounded mmap BF16 weight retention: one fifth of VRAM, capped at 1.5 GiB, released before VAE decode.
+- Automatic CUDA architecture detection with `CUDA_ARCH` override for cross-compilation.
+
+### CUDA optimization results
+
+- 512x512, four steps: 5.4s -> 4.5s after GPU VAE attention and bounded weight retention.
+- 1024x1024, one step: 5.2s -> 4.1s; VAE decode 1.9s -> 1.0s.
+- 1280x1280, one step: 6.4s, remaining on the tiled cuBLAS attention path.
+- Correctness: all three Flux regression tests pass with unchanged mean differences.
+- Memory safety: NVIDIA Compute Sanitizer reports zero errors on the CUDA smoke test.
+
+### CUDA next targets
+
+- Overlap next-block weight upload with current-block compute using a second stream, if profiling shows a substantial gain over bounded retention.
+- Improve the VAE encoder path for high-resolution img2img workloads.
+- Add automated Z-Image CUDA coverage when the model is available locally.
 
 ## Credits attribution rules
 - Ideas / kernels / approaches should be only taken from BSD / MIT licensed code.

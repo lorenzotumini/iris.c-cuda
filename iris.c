@@ -1174,7 +1174,7 @@ static int fit_refs_for_attention(int num_heads,
  * transformer, which attends to reference tokens via joint attention -- this
  * is fundamentally different from traditional img2img that adds noise to the
  * encoded image. References are dynamically resized if the resulting attention
- * matrix would exceed the 4GB MPS memory limit. */
+ * matrix would exceed the shared conservative attention-memory budget. */
 iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
                          const iris_image *input, const iris_params *params) {
     if (!ctx || !prompt || !input) {

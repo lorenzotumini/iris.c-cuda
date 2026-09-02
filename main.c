@@ -248,7 +248,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --zoom N          Terminal image zoom factor (default: 2 for Retina)\n\n");
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
-    fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
+    fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default; recommended for GPU)\n");
     fprintf(stderr, "      --no-mmap         Disable mmap, load all weights upfront\n");
     fprintf(stderr, "      --no-license-info Suppress non-commercial license warning\n");
     fprintf(stderr, "      --blas-threads N  Set number of BLAS threads (OpenBLAS only)\n");
@@ -321,7 +321,7 @@ int main(int argc, char *argv[]) {
     };
 
     int width_set = 0, height_set = 0, steps_set = 0;
-    int use_mmap = 1;  /* mmap is default (fastest on MPS) */
+    int use_mmap = 1;  /* Default; recommended for GPU and low-memory hosts. */
     int show_image = 0;
     int show_steps = 0;
     int debug_py = 0;
@@ -493,7 +493,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Enable mmap mode if requested (reduces memory, slower inference) */
+    /* Enable mmap mode if requested. Performance is backend-dependent. */
     if (use_mmap) {
         iris_set_mmap(ctx, 1);
         LOG_VERBOSE("  Using mmap mode for text encoder (lower memory)\n");

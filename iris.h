@@ -121,9 +121,9 @@ void iris_free(iris_ctx *ctx);
 void iris_release_text_encoder(iris_ctx *ctx);
 
 /*
- * Enable mmap mode for text encoder (--mmap).
- * Uses memory-mapped bf16 weights directly instead of converting to f32.
- * Reduces memory usage from ~16GB to ~8GB but is slower due to on-the-fly conversion.
+ * Enable or disable memory-mapped model weights (--mmap/--no-mmap).
+ * Reduces host-memory use by loading layers on demand. Recommended for CUDA
+ * and MPS; CPU BLAS can be faster without mmap when sufficient RAM is available.
  * Call this after iris_load_dir() and before first generation.
  */
 void iris_set_mmap(iris_ctx *ctx, int enable);
@@ -164,7 +164,8 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
                          const iris_image *input, const iris_params *params);
 
 /*
- * Multi-reference generation (up to 4 reference images for klein).
+ * Multi-reference generation for Flux. The CLI accepts up to 16 references;
+ * practical limits also depend on the combined attention sequence and memory.
  */
 iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
                           const iris_image **refs, int num_refs,
@@ -201,7 +202,7 @@ iris_image *iris_generate_with_embeddings_and_noise(iris_ctx *ctx,
  * ======================================================================== */
 
 /*
- * Load image from file (PNG or PPM).
+ * Load image from file (PNG, JPEG, or PPM). JPEG is read-only.
  * Returns NULL on error.
  */
 iris_image *iris_image_load(const char *path);
@@ -240,7 +241,8 @@ iris_image *iris_image_resize(const iris_image *img, int new_width, int new_heig
  * ======================================================================== */
 
 /*
- * Set random seed for reproducible generation.
+ * Seed the low-level global RNG. High-level generation should normally set
+ * iris_params.seed, because image-noise initialization uses that value.
  */
 void iris_set_seed(int64_t seed);
 
@@ -278,7 +280,7 @@ void iris_set_step_image_callback(iris_ctx *ctx, iris_step_image_cb_t callback);
 
 /*
  * Encode image to latent space using VAE encoder.
- * Returns latent tensor [1, 128, H/16, W/16].
+ * Returns [1, latent_channels, H/16, W/16] (128 for Flux, 64 for Z-Image).
  * Caller must free() the returned pointer.
  */
 float *iris_encode_image(iris_ctx *ctx, const iris_image *img,
@@ -292,14 +294,14 @@ iris_image *iris_decode_latent(iris_ctx *ctx, const float *latent,
 
 /*
  * Encode text prompt to embeddings.
- * Returns embedding tensor [1, seq_len, 7680].
+ * Returns [seq_len, iris_text_dim(ctx)] in row-major order.
  * Caller must free() the returned pointer.
  */
 float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len);
 
 /*
  * Run single denoising step.
- * z: current latent [1, 128, H, W]
+ * z: current latent [1, latent_channels, H, W]
  * t: timestep (0.0 to 1.0)
  * text_emb: text embeddings
  * Returns velocity prediction.

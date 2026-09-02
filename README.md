@@ -1,8 +1,11 @@
 # Iris - a C inference pipeline for image synthesis models
 
-> **CUDA fork:** This fork adds an NVIDIA CUDA backend, optimized and tested on an RTX 3070 Ti (Ampere, `sm_86`). The original Iris project is by [antirez](https://github.com/antirez/iris.c).
+> **CUDA fork:** This fork adds a native NVIDIA CUDA backend, optimized and
+> tested on an 8 GB RTX 3070 Ti (Ampere, `sm_86`). It preserves the original
+> MPS, BLAS, and generic backends. The original Iris project is by
+> [antirez](https://github.com/antirez/iris.c).
 
-Iris is an inference pipeline that generates images from text prompts using open weights diffusion transformer models. It is implemented entirely in C. MPS, CUDA, and BLAS acceleration are optional but recommended. Under macOS, a BLAS API is part of the system, so nothing is required.
+Iris is an inference pipeline that generates images from text prompts using open weights diffusion transformer models. It is implemented in C and CUDA. MPS, CUDA, and BLAS acceleration are optional but recommended. The generic backend has no external dependencies; accelerated builds use platform GPU libraries or BLAS.
 
 The name comes from the Greek goddess Iris, messenger of the gods and personification of the rainbow.
 
@@ -21,7 +24,7 @@ Supported model families:
 ```bash
 # Build (choose your backend)
 make mps       # Apple Silicon (fastest)
-# or: make cuda    # NVIDIA GPU (Linux, CUDA toolkit required)
+# or: make cuda    # NVIDIA GPU (Linux, CUDA toolkit + OpenBLAS required)
 # or: make blas    # Intel Mac / Linux with OpenBLAS
 # or: make generic # Pure C, no dependencies
 
@@ -58,7 +61,8 @@ pip install huggingface_hub && python download_model.py zimage-turbo
 ./iris -d zimage-turbo -p "a fish" -o fish.png
 ```
 
-That's it. No Python runtime is required at inference time. The CUDA build requires the NVIDIA CUDA toolkit when compiling and its runtime libraries when running.
+That's it. No Python runtime is required at inference time. A successful CUDA
+run prints `CUDA: NVIDIA GPU Acceleration Enabled` before loading the model.
 
 ## Example Output
 
@@ -74,16 +78,17 @@ That's it. No Python runtime is required at inference time. The CUDA build requi
 
 ## Features
 
-- **Zero dependencies**: Pure C implementation, works standalone. BLAS optional for ~30x speedup (Apple Accelerate on macOS, OpenBLAS on Linux)
+- **Standalone inference**: No Python runtime or ML framework is required. The generic backend has no dependencies; accelerated builds use BLAS, Metal, or CUDA
 - **Metal GPU acceleration**: Automatic on Apple Silicon Macs. Performance matches PyTorch's optimized MPS pipeline
-- **CUDA GPU acceleration**: Tensor Core attention and cuBLAS kernels for NVIDIA GPUs; optimized for 8 GB Ampere cards such as the RTX 3070 Ti
+- **CUDA GPU acceleration**: Native BF16 Tensor Core linear layers and attention, GPU-resident Qwen3 and VAE decode, tiled cuBLAS convolution, and asynchronous allocation for NVIDIA GPUs
+- **Bounded CUDA memory use**: Query-tiled attention and a budgeted mmap weight cache avoid multi-gigabyte temporary buffers and keep 1024px generation practical on an 8 GB RTX 3070 Ti
 - **Runs where Python can't**: Memory-mapped weights (default) enable inference on 8GB RAM systems where the Python ML stack cannot run at all
 - **Text-to-image**: Generate images from text prompts
 - **Image-to-image**: Transform existing images guided by prompts (Flux models)
 - **Multi-reference**: Combine multiple reference images (e.g., `-i car.png -i beach.png` for "car on beach")
 - **Integrated text encoder**: Qwen3 encoder built-in (4B or 8B depending on model), no external embedding computation needed
 - **Memory efficient**: Automatic encoder release after encoding (up to ~16GB freed)
-- **Memory-mapped weights**: Enabled by default. Reduces peak memory from ~16GB to ~4-5GB. Fastest mode on MPS; BLAS users with plenty of RAM may prefer `--no-mmap` for faster inference
+- **Memory-mapped weights**: Enabled by default. Reduces host-memory use from ~16GB to ~4-5GB for the 4B model. Recommended for CUDA and MPS; BLAS users with plenty of RAM may prefer `--no-mmap`
 - **Size-independent seeds**: Same seed produces similar compositions at different resolutions. Explore at 256x256, then render at 512x512 with the same seed
 - **Terminal image display**: watch the resulting image without leaving your terminal (Ghostty, Kitty, iTerm2, WezTerm, or Konsole).
 
@@ -208,6 +213,8 @@ Done -> /tmp/iris-.../image-0003.png (ref $2)
     --linear          Use linear timestep schedule (see below)
     --power           Use power curve timestep schedule (see below)
     --power-alpha N   Set power schedule exponent (default: 2.0)
+    --sigmoid         Use the Flux shifted sigmoid schedule
+    --flowmatch       Use the Z-Image FlowMatch Euler schedule
     --base            Force base model mode (undistilled, CFG enabled)
 ```
 
@@ -227,9 +234,10 @@ Done -> /tmp/iris-.../image-0003.png (ref $2)
 
 **Other options:**
 ```
--m, --mmap            Memory-mapped weights (default, fastest on MPS)
+-m, --mmap            Memory-mapped weights (default; recommended for GPU)
     --no-mmap         Disable mmap, load all weights upfront
     --no-license-info Suppress non-commercial license warning (9B model)
+    --blas-threads N  Set OpenBLAS thread count
 -e, --embeddings PATH Load pre-computed text embeddings (advanced)
 -h, --help            Show help
 ```
@@ -284,11 +292,35 @@ make cuda       # NVIDIA CUDA GPU (Linux; auto-detects the installed GPU)
 **Recommended:**
 - macOS Apple Silicon: `make mps`
 - macOS Intel: `make blas`
-- Linux with a supported NVIDIA GPU: `make cuda`. The build detects the first
-  GPU's compute capability and falls back to `sm_86` if detection is unavailable;
-  cross-compilers can override it explicitly, for example `make cuda CUDA_ARCH=sm_89`.
+- Linux with a supported NVIDIA GPU: `make cuda`
 - Linux with OpenBLAS: `make blas`
 - Linux without OpenBLAS: `make generic`
+
+### CUDA build
+
+The CUDA backend requires:
+
+- Linux with a working NVIDIA driver
+- An Ampere (`sm_80`) or newer NVIDIA GPU for native BF16 acceleration
+- The CUDA toolkit, including `nvcc`, CUDA headers, cuBLAS, cuBLASLt, and the CUDA runtime
+- OpenBLAS development headers and library
+
+The defaults expect CUDA under `/opt/cuda`. Override the location when needed:
+
+```bash
+make cuda CUDA_PATH=/usr/local/cuda
+```
+
+The build reads the first GPU's compute capability through `nvidia-smi`. If
+detection is unavailable it falls back to `sm_86`; cross-compilers and
+multi-GPU systems can override the target explicitly:
+
+```bash
+make cuda CUDA_ARCH=sm_89
+```
+
+At runtime, `CUDA: NVIDIA GPU Acceleration Enabled` confirms that the CUDA
+backend initialized. If this message is absent, Iris falls back to the CPU path.
 
 For `make blas` on Linux, install OpenBLAS first:
 ```bash
@@ -314,7 +346,21 @@ make test        # Run all tests
 make test-quick  # Run only the quick 64x64 test
 ```
 
-The tests compare generated images against reference images in `test_vectors/`. A test passes if the maximum pixel difference is within tolerance (to allow for minor floating-point variations across platforms).
+The test runner requires Python 3, NumPy, and Pillow, but these are not needed
+for building or running Iris itself. Install them in a virtual environment if
+they are not already available:
+
+```bash
+python3 -m venv .test-venv
+. .test-venv/bin/activate
+pip install numpy pillow
+```
+
+The tests compare generated images against reference images in `test_vectors/`.
+A test passes when its mean absolute pixel difference is within tolerance;
+the maximum difference is also reported for diagnosis. This allows harmless
+floating-point variation across CPU, MPS, and CUDA implementations while still
+catching substantial output changes.
 
 **Test cases:**
 | Test | Size | Steps | Purpose |
@@ -329,7 +375,11 @@ You can also run the test script directly for more options:
 python3 run_test.py --help
 python3 run_test.py --quick
 python3 run_test.py --flux-binary ./iris --model-dir /path/to/model
+python3 run_test.py --flux-binary ./iris --model-dir /path/to/model --full
 ```
+
+The optional Z-Image smoke test runs only when a Z-Image model directory is
+detected or supplied with `--zimage-model-dir`.
 
 ## Model Download
 
@@ -365,13 +415,39 @@ pip install huggingface_hub && python download_model.py zimage-turbo
 
 | Model | Directory | Size | Components |
 |-------|-----------|------|------------|
-| 4B distilled | `./flux-klein-4b` | ~16GB | VAE (~300MB), Transformer (~4GB), Qwen3-4B (~8GB) |
-| 4B base | `./flux-klein-4b-base` | ~16GB | VAE (~300MB), Transformer (~4GB), Qwen3-4B (~8GB) |
+| 4B distilled | `./flux-klein-4b` | ~16GB | VAE (~160MB), Transformer (~7.3GB), Qwen3-4B (~7.5GB) |
+| 4B base | `./flux-klein-4b-base` | ~16GB | VAE (~160MB), Transformer (~7.3GB), Qwen3-4B (~7.5GB) |
 | 9B distilled | `./flux-klein-9b` | ~30GB | VAE (~300MB), Transformer (~17GB), Qwen3-8B (~15GB) |
 | 9B base | `./flux-klein-9b-base` | ~30GB | VAE (~300MB), Transformer (~17GB), Qwen3-8B (~15GB) |
 | Z-Image-Turbo | `./zimage-turbo` | ~12GB | VAE, Transformer (~6B), Qwen3-4B |
 
 ## How Fast Is It?
+
+### NVIDIA CUDA
+
+Benchmarks on an **NVIDIA RTX 3070 Ti** (8 GB, Ampere `sm_86`) using this
+fork's CUDA backend, the 4B distilled model, mmap mode, and four denoising
+steps:
+
+| Size | Total time | Denoising | VAE decode |
+|------|-----------:|----------:|-----------:|
+| 256x256 | 3.7s | 2.61s | 0.1s |
+| 512x512 | 4.5s | 3.27s | 0.3s |
+| 1024x1024 | 9.8s | 7.78s | 1.0s |
+
+The benchmark command was:
+
+```bash
+./iris -v -d flux-klein-4b -p "A woman wearing sunglasses" \
+  -o /tmp/bench.png -W 512 -H 512 -s 4 -S 42
+```
+
+Times are complete wall-clock generation times with a warm filesystem cache;
+they include model component loading, text encoding, denoising, VAE decode,
+and saving. Performance varies with prompt length, driver/toolkit versions,
+desktop GPU usage, cooling, and PCIe configuration.
+
+### Apple MPS
 
 Benchmarks on **Apple M3 Max** (128GB RAM), Flux distilled model (4 steps).
 
@@ -392,7 +468,7 @@ The MPS implementation is faster than the PyTorch optimized pipeline at all reso
 
 ### Community Benchmarks
 
-The following timings for 512x512 generation (Flux distilled model, 4 steps) were reported by users. They can serve as a rough indication of the performance you could expect, but results vary widely depending on the hardware, Metal availability (the code is heavily optimized for Apple Silicon via MPS), and whether BLAS acceleration is used on CPU.
+The following timings for 512x512 generation (Flux distilled model, 4 steps) were reported by users. They can serve as a rough indication of the performance you could expect, but results vary widely depending on hardware, backend, available memory, and system load.
 
 | Hardware | Backend | 512x512 |
 |----------|---------|---------|
@@ -407,6 +483,12 @@ The following timings for 512x512 generation (Flux distilled model, 4 steps) wer
 ## Resolution Limits
 
 **Maximum resolution**: 1792x1792 pixels. The model produces good results up to this size; beyond this resolution image quality degrades significantly (this is a model limitation, not an implementation issue).
+
+On CUDA, attention queries are processed in bounded tiles once the full score
+matrix would exceed the workspace budget. This avoids the abrupt scalar-kernel
+fallback and multi-gigabyte score allocation that older versions encountered
+above approximately 1024 pixels. Runtime still grows quickly because attention
+compute is quadratic in the number of image tokens.
 
 **Minimum resolution**: 64x64 pixels.
 
@@ -455,6 +537,27 @@ Z-Image-Turbo uses an S3-DiT single-stream architecture with noise and context r
 | Refiner layers | 2 (noise) + 2 (context) |
 | Text Encoder | Qwen3-4B (hidden_states[-2]) |
 | VAE | 16 latent channels, patch_size=2 |
+
+## CUDA Backend Design
+
+The CUDA backend uses the model's BF16 weights directly and keeps transformer
+activations in BF16 so Ampere Tensor Cores can accelerate the large matrix
+products. Attention logits and softmax remain in FP32; normalized
+probabilities are narrowed to BF16 only for the value projection. This keeps
+the output within the repository's reference tolerance without expanding all
+weights to FP32 in VRAM.
+
+Important implementation details:
+
+- Q, K, and V remain in token-major, head-interleaved layout. Strided batched cuBLAS calls consume that layout directly, avoiding explicit head transposes.
+- Attention uses full matrices when they fit the 384 MiB workspace and query tiles otherwise. High-resolution runs stay on the cuBLAS/Tensor Core path.
+- Qwen3 remains on the GPU across its forward pass, with one synchronization at the end instead of per-layer CPU/GPU round trips.
+- The VAE decoder remains on the GPU, including bottleneck attention. Convolution uses TF32 cuBLAS with a bounded 128 MiB im2col tile and a direct path for 1x1 kernels.
+- Stream-ordered `cudaMallocAsync`/`cudaFreeAsync` avoids device-wide allocation synchronization when supported by the installed runtime.
+- In mmap mode, stable BF16 block weights are uploaded on demand. A bounded subset is retained across denoising steps and released before VAE decode.
+
+The backend contains scalar fallbacks for allocation or cuBLAS failures, but
+normal Ampere execution should report BF16 GPU acceleration in verbose output.
 
 ## Timestep Schedules
 
@@ -520,6 +623,29 @@ If you have a terminal supporting the iTerm2 or Kitty terminal graphics protocol
 
 ## Memory Requirements
 
+The original tables below describe **host RAM**. Discrete CUDA GPUs also have
+a separate VRAM requirement.
+
+### CUDA VRAM
+
+The CUDA backend was designed around the 8 GB RTX 3070 Ti. With the 4B
+distilled model in mmap mode, a four-step 1024x1024 run sampled about 3.6 GiB
+of process VRAM during denoising. Exact usage varies with prompt length,
+reference images, resolution, driver allocation behavior, and other processes
+using the GPU.
+
+CUDA memory is bounded in three important places:
+
+- Transformer attention uses a 384 MiB query-tiled workspace instead of a full quadratic allocation at high resolutions.
+- The mmap-backed BF16 transformer weight cache uses at most one fifth of total VRAM, capped at 1.5 GiB, and is released before VAE decode.
+- VAE convolution uses a tiled im2col buffer instead of materializing an unbounded convolution matrix.
+
+An 8 GB card is sufficient for the tested 4B txt2img workloads, including the
+one-step 1280x1280 stress test. Multi-reference generation and larger models
+need more memory; the 9B and Z-Image CUDA paths have not been benchmarked on
+the 3070 Ti in this fork. Reduce `-W`/`-H`, use smaller reference images, and
+keep mmap enabled if you encounter an out-of-memory error.
+
 ### 4B model
 
 With mmap (default):
@@ -572,11 +698,13 @@ Memory-mapped weight loading is enabled by default. Use `--no-mmap` to disable a
 - **Text encoder (Qwen3):** Each of the 36 transformer layers (~400MB each) is loaded, processed, and immediately freed. Only ~2GB stays resident instead of ~8GB.
 - **Denoising transformer:** Each of the 5 double-blocks (~300MB) and 20 single-blocks (~150MB) is loaded on-demand and freed after use. Only ~200MB of shared weights stays resident instead of ~4GB.
 
-This reduces peak memory from ~16GB to ~4-5GB, making inference possible on 16GB RAM systems where the Python ML stack cannot run at all.
+This reduces peak host memory from ~16GB to ~4-5GB, making inference possible on 16GB RAM systems where the Python ML stack cannot run at all.
 
 **Performance varies by backend:**
 
 - **MPS (Apple Silicon):** mmap is the **fastest** mode. The model stores weights in bf16 format, and MPS uses them directly via zero-copy pointers into the memory-mapped region. No conversion overhead, and the kernel handles paging efficiently.
+
+- **CUDA (NVIDIA):** mmap is the recommended mode, especially on 8 GB cards. BF16 weights are streamed to the GPU block by block, while a bounded subset remains resident across denoising steps to avoid repeated PCIe transfers. The retained subset is released before VAE decode.
 
 - **BLAS (CPU):** mmap is **slightly slower** but uses much less RAM. BLAS requires f32 weights, so each block must be converted from bf16->f32 on every step (25 blocks x 4 steps = 100 conversions). With `--no-mmap`, this conversion happens once at startup. **Recommendation:** If you have 32GB+ RAM and use BLAS, try `--no-mmap` for faster inference. If RAM is limited, mmap lets you run at all.
 
@@ -584,7 +712,9 @@ This reduces peak memory from ~16GB to ~4-5GB, making inference possible on 16GB
 
 ## C Library API
 
-The library can be integrated into your own C/C++ projects. Link against `libiris.a` and include `iris.h`.
+The library can be integrated into your own C/C++ projects. Link against
+`libiris.a` and include `iris.h`. The current `make lib` target builds the CPU
+library; `make cuda` builds the CUDA-enabled command-line executable.
 
 ### Text-to-Image Generation
 
@@ -679,7 +809,8 @@ int main(void) {
 
 ### Generating Multiple Images
 
-When generating multiple images with different seeds but the same prompt, you can avoid reloading the text encoder:
+When generating multiple images with different seeds but the same prompt,
+encode the prompt once and reuse its embeddings:
 
 ```c
 iris_ctx *ctx = iris_load_dir("flux-klein-4b");
@@ -687,11 +818,20 @@ iris_params params = IRIS_PARAMS_DEFAULT;
 params.width = 256;
 params.height = 256;
 
+int text_seq = 0;
+float *text_emb = iris_encode_text(ctx, "A mountain landscape at sunset", &text_seq);
+if (!text_emb) {
+    iris_free(ctx);
+    return 1;
+}
+iris_release_text_encoder(ctx);  /* Make room before loading the transformer. */
+
 /* Generate 5 variations with different seeds */
 for (int i = 0; i < 5; i++) {
-    iris_set_seed(1000 + i);
+    params.seed = 1000 + i;
 
-    iris_image *img = iris_generate(ctx, "A mountain landscape at sunset", &params);
+    iris_image *img = iris_generate_with_embeddings(ctx, text_emb, text_seq, &params);
+    if (!img) break;
 
     char filename[64];
     snprintf(filename, sizeof(filename), "landscape_%d.png", i);
@@ -699,10 +839,13 @@ for (int i = 0; i < 5; i++) {
     iris_image_free(img);
 }
 
+free(text_emb);
 iris_free(ctx);
 ```
 
-Note: The text encoder (~8GB) is automatically released after the first generation to save memory. It reloads automatically if you use a different prompt.
+`iris_generate()` releases the text encoder before diffusion and reloads it
+when another prompt must be encoded. Reusing embeddings avoids that reload for
+same-prompt variations.
 
 ### Error Handling
 
@@ -727,6 +870,12 @@ void iris_free(iris_ctx *ctx);                     /* Free all resources */
 iris_image *iris_generate(iris_ctx *ctx, const char *prompt, const iris_params *params);
 iris_image *iris_img2img(iris_ctx *ctx, const char *prompt, const iris_image *input,
                           const iris_params *params);
+iris_image *iris_multiref(iris_ctx *ctx, const char *prompt,
+                          const iris_image **refs, int num_refs,
+                          const iris_params *params);
+iris_image *iris_generate_with_embeddings(iris_ctx *ctx,
+                                           const float *text_emb, int text_seq,
+                                           const iris_params *params);
 ```
 
 **Image handling:**
@@ -734,17 +883,24 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt, const iris_image *in
 iris_image *iris_image_load(const char *path);     /* Load PNG, JPEG, or PPM */
 int iris_image_save(const iris_image *img, const char *path);  /* 0=success, -1=error */
 int iris_image_save_with_seed(const iris_image *img, const char *path, int64_t seed);  /* Save with metadata */
+iris_image *iris_image_create(int width, int height, int channels);
 iris_image *iris_image_resize(const iris_image *img, int new_w, int new_h);
 void iris_image_free(iris_image *img);
 ```
 
 **Utilities:**
 ```c
-void iris_set_seed(int64_t seed);                  /* Set RNG seed for reproducibility */
+void iris_set_seed(int64_t seed);                  /* Seed low-level RNG; prefer params.seed */
 const char *iris_get_error(void);                  /* Get last error message */
 void iris_release_text_encoder(iris_ctx *ctx);     /* Manually free ~8GB (optional) */
+void iris_set_mmap(iris_ctx *ctx, int enable);     /* Configure mmap before generation */
 int iris_is_distilled(iris_ctx *ctx);              /* 1 = distilled, 0 = base */
+int iris_is_zimage(iris_ctx *ctx);                 /* 1 = Z-Image, 0 = Flux */
+int iris_is_non_commercial(iris_ctx *ctx);         /* Model license warning flag */
+int iris_text_dim(iris_ctx *ctx);                  /* Text embedding width */
+const char *iris_model_info(iris_ctx *ctx);        /* Model summary */
 void iris_set_base_mode(iris_ctx *ctx);            /* Force base model mode */
+float *iris_encode_text(iris_ctx *ctx, const char *prompt, int *out_seq_len); /* free() result */
 ```
 
 ### Parameters
@@ -756,16 +912,51 @@ typedef struct {
     int num_steps;          /* Denoising steps, 0 = auto (4 distilled, 50 base, 9 zimage) */
     int64_t seed;           /* Random seed, -1 for random (default: -1) */
     float guidance;         /* CFG guidance scale, 0 = auto (1.0 distilled, 4.0 base, 0.0 zimage) */
-    int linear_schedule;    /* Use linear timestep schedule (0 = shifted sigmoid) */
-    int power_schedule;     /* Use power curve timestep schedule */
+    int schedule;           /* IRIS_SCHEDULE_DEFAULT/LINEAR/POWER/SIGMOID/FLOWMATCH */
     float power_alpha;      /* Exponent for power schedule (default: 2.0) */
 } iris_params;
 
 /* Initialize with sensible defaults (auto steps and guidance from model type) */
-#define IRIS_PARAMS_DEFAULT { 256, 256, 0, -1, 0.0f, 0, 0, 2.0f }
+#define IRIS_PARAMS_DEFAULT { 256, 256, 0, -1, 0.0f, IRIS_SCHEDULE_DEFAULT, 2.0f }
 ```
 
 ## Debugging
+
+### CUDA troubleshooting
+
+**`nvcc` not found:** Set `CUDA_PATH` to the toolkit installation containing
+`bin/nvcc`, for example:
+
+```bash
+make cuda CUDA_PATH=/usr/local/cuda
+```
+
+**Unsupported GPU architecture during compilation:** Specify the target
+explicitly. Compute capability `8.6`, for example, maps to `sm_86`:
+
+```bash
+nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+make cuda CUDA_ARCH=sm_86
+```
+
+**No CUDA startup message:** A CUDA build prints
+`CUDA: NVIDIA GPU Acceleration Enabled`. If it does not, verify that
+`nvidia-smi` can communicate with the driver and that the CUDA runtime and
+cuBLAS libraries are visible to the dynamic linker. Without an initialized
+GPU backend, Iris falls back to CPU execution and will be much slower.
+
+**CUDA out of memory:** Keep mmap enabled, reduce output dimensions, use fewer
+or smaller reference images, and close other GPU applications. `--no-mmap` is
+not recommended on an 8 GB card.
+
+For low-level kernel validation, NVIDIA Compute Sanitizer can run a small
+generation directly:
+
+```bash
+compute-sanitizer --tool memcheck --error-exitcode 99 \
+  ./iris -d flux-klein-4b -p "CUDA memory check" \
+  -o /tmp/iris-memcheck.png -W 64 -H 64 -s 1 -S 7
+```
 
 ### Comparing with Python Reference
 

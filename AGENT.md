@@ -1,4 +1,4 @@
-This is a C implementation of two image synthesis model families:
+This is a C implementation, with optional Metal and CUDA GPU backends, of two image synthesis model families:
 - Flux.2 Klein (4B and 9B variants)
 - Z-Image-Turbo (6B)
 
@@ -49,6 +49,9 @@ iris_kernels.c            - CPU kernels (softmax, RMSNorm, etc.)
 iris_metal.m              - Metal GPU acceleration runtime
 iris_metal.h              - Metal/GPU API surface
 iris_shaders.metal        - Metal compute kernels
+iris_cuda.cu              - CUDA runtime, memory management, cuBLAS dispatch
+iris_cuda.h               - CUDA/GPU API surface
+iris_cuda_kernels.cu      - CUDA compute kernels
 iris_safetensors.c        - Weight loading
 iris_image.c              - Image I/O (PNG/PPM/JPEG)
 png.c                     - PNG encoder/decoder
@@ -62,14 +65,15 @@ main.c                    - CLI entry point
 
 # Build Targets
 
-This project implements three targets:
+This project implements four targets:
 - MPS: Apple Silicon GPU path.
+- CUDA: NVIDIA GPU path (native BF16; Ampere or newer recommended).
 - BLAS: optimized CPU inference via BLAS/OpenBLAS.
 - generic: pure C fallback, very slow.
 
 # Development Rules
 
-- No additional project dependencies. Acceptable external deps are BLAS/OpenBLAS and Metal/MPS from macOS.
+- No model-runtime framework dependencies. Acceptable external deps are BLAS/OpenBLAS, Metal/MPS from macOS, and the NVIDIA CUDA toolkit/cuBLAS for the CUDA target.
 - Reject tiny speed gains that add complexity; prefer substantial wins.
 - Always test code modifications with `make test`.
 - Once changes are validated, commit them.
@@ -90,6 +94,13 @@ Flux examples:
 Z-Image example:
 
     ./iris -d zimage-turbo -p "a fish" -o /tmp/zimage.png
+
+CUDA build and smoke test:
+
+    make cuda
+    ./iris -d flux-klein-4b -p "a cat" -o /tmp/cuda.png -W 64 -H 64 -s 1
+
+Successful CUDA initialization prints `CUDA: NVIDIA GPU Acceleration Enabled`.
 
 If model weights are missing, use the download script only after user approval.
 
@@ -169,6 +180,27 @@ Shared:
 - RoPE pair rotation is:
   - `out0 = cos * x0 - sin * x1`
   - `out1 = cos * x1 + sin * x0`
+
+# CUDA Critical Implementation Details
+
+- Native CUDA BF16 execution requires Ampere (`sm_80`) or newer. The default
+  build detects compute capability with `nvidia-smi` and accepts an explicit
+  `CUDA_ARCH` override.
+- Transformer Q/K/V tensors are token-major `[sequence, head, dimension]`.
+  cuBLAS consumes this interleaved layout directly; do not add head transposes
+  without a measured reason.
+- Attention logits and softmax are FP32. BF16 probabilities are used only for
+  the value GEMM. Query tiling bounds attention workspace at 384 MiB.
+- VAE tensors use NCHW at convolution boundaries and token-major NHWC for the
+  bottleneck attention GEMMs. Layout conversion stays on the GPU.
+- CUDA uses stream-ordered allocation when available. Frees may be queued
+  behind kernels; never invalidate mmap weights before their final queued use.
+- The streaming weight cache retains only stable mmap-backed BF16 pointers.
+  Temporary F32 host allocations must always be invalidated before `free()`.
+- Retained streaming weights are budgeted to one fifth of VRAM (maximum
+  1.5 GiB) and cleared before VAE decode.
+- Preserve CPU/MPS compilation when adding CUDA API calls. Shared GPU code in
+  `iris_vae.c` must use backend conditionals when an API exists only in CUDA.
 
 # Flux RoPE (Rotary Position Embedding)
 
