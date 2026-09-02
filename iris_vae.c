@@ -474,7 +474,9 @@ float *iris_vae_encode(iris_vae_t *vae, const float *img,
 
 #if defined(USE_METAL) || defined(USE_CUDA)
 
-/* GPU resblock: all operations on GPU, returns new tensor */
+/* GPU resblock: all operations on GPU. Takes ownership of x and returns the
+ * residual result. Normalization is safe in-place and avoids a full extra
+ * activation buffer at high resolution. */
 static iris_gpu_tensor_t resblock_forward_gpu(iris_gpu_tensor_t x,
                                                const vae_resblock_t *block,
                                                int batch, int H, int W,
@@ -483,6 +485,20 @@ static iris_gpu_tensor_t resblock_forward_gpu(iris_gpu_tensor_t x,
     int out_ch = block->out_channels;
     int spatial = H * W;
     int n = batch * out_ch * spatial;
+    const size_t skip_bytes = (size_t)n * sizeof(float);
+    float *skip_host = NULL;
+    int spill_skip = 0;
+
+#ifdef USE_CUDA
+    /* A channel-reducing block at the largest image sizes otherwise keeps
+     * input, residual, and first convolution output resident simultaneously.
+     * Spill the exact residual values only when that projected peak no longer
+     * fits with a conservative convolution-workspace margin. */
+    const size_t conv_margin = 384ULL * 1024 * 1024;
+    size_t free_bytes = iris_cuda_memory_free();
+    spill_skip = free_bytes != 0 &&
+                 free_bytes < 2 * skip_bytes + conv_margin;
+#endif
 
     /* Skip connection */
     iris_gpu_tensor_t skip;
@@ -491,39 +507,72 @@ static iris_gpu_tensor_t resblock_forward_gpu(iris_gpu_tensor_t x,
                                     batch, in_ch, out_ch, H, W, 1, 1, 1, 0);
     } else {
         skip = iris_gpu_tensor_alloc((size_t)n);
-        iris_gpu_copy_f32(skip, x, (size_t)n);
+        if (skip) iris_gpu_copy_f32(skip, x, (size_t)n);
     }
-    if (!skip) return NULL;
+    if (!skip) {
+        iris_gpu_tensor_free(x);
+        return NULL;
+    }
 
-    /* Main path: norm1 -> swish -> conv1 -> norm2 -> swish -> conv2 */
-    iris_gpu_tensor_t work = iris_gpu_tensor_alloc((size_t)batch * in_ch * spatial);
-    if (!work) { iris_gpu_tensor_free(skip); return NULL; }
+    if (spill_skip) {
+        skip_host = (float *)malloc(skip_bytes);
+        if (!skip_host) {
+            iris_gpu_tensor_free(skip);
+            iris_gpu_tensor_free(x);
+            return NULL;
+        }
+        iris_gpu_tensor_read(skip, skip_host);
+        iris_gpu_tensor_free(skip);
+        skip = NULL;
+        iris_metal_reset_transient();
+    }
 
-    iris_gpu_group_norm_f32(work, x, block->norm1_weight, block->norm1_bias,
+    /* Main path: norm1 -> swish -> conv1 -> norm2 -> swish -> conv2.
+     * The input is no longer needed after the skip operation queued above,
+     * so reuse it for the normalized activation. */
+    iris_gpu_group_norm_f32(x, x, block->norm1_weight, block->norm1_bias,
                              batch, in_ch, spatial, num_groups, eps);
-    iris_gpu_swish_f32(work, work, batch * in_ch * spatial);
+    iris_gpu_swish_f32(x, x, batch * in_ch * spatial);
 
-    iris_gpu_tensor_t conv1_out = iris_gpu_conv2d_f32(work, block->conv1_weight, block->conv1_bias,
+    iris_gpu_tensor_t conv1_out = iris_gpu_conv2d_f32(x, block->conv1_weight, block->conv1_bias,
                                                        batch, in_ch, out_ch, H, W, 3, 3, 1, 1);
-    iris_gpu_tensor_free(work);
-    if (!conv1_out) { iris_gpu_tensor_free(skip); return NULL; }
+    iris_gpu_tensor_free(x);
+    if (!conv1_out) {
+        iris_gpu_tensor_free(skip);
+        free(skip_host);
+        return NULL;
+    }
 
-    work = iris_gpu_tensor_alloc((size_t)batch * out_ch * spatial);
-    if (!work) { iris_gpu_tensor_free(skip); iris_gpu_tensor_free(conv1_out); return NULL; }
+    if (spill_skip) iris_metal_reset_transient();
 
-    iris_gpu_group_norm_f32(work, conv1_out, block->norm2_weight, block->norm2_bias,
+    iris_gpu_group_norm_f32(conv1_out, conv1_out,
+                             block->norm2_weight, block->norm2_bias,
                              batch, out_ch, spatial, num_groups, eps);
-    iris_gpu_swish_f32(work, work, batch * out_ch * spatial);
-    iris_gpu_tensor_free(conv1_out);
+    iris_gpu_swish_f32(conv1_out, conv1_out, batch * out_ch * spatial);
 
-    conv1_out = iris_gpu_conv2d_f32(work, block->conv2_weight, block->conv2_bias,
-                                     batch, out_ch, out_ch, H, W, 3, 3, 1, 1);
-    iris_gpu_tensor_free(work);
-    if (!conv1_out) { iris_gpu_tensor_free(skip); return NULL; }
+    iris_gpu_tensor_t conv2_out = iris_gpu_conv2d_f32(
+        conv1_out, block->conv2_weight, block->conv2_bias,
+        batch, out_ch, out_ch, H, W, 3, 3, 1, 1);
+    iris_gpu_tensor_free(conv1_out);
+    if (!conv2_out) {
+        iris_gpu_tensor_free(skip);
+        free(skip_host);
+        return NULL;
+    }
+
+    if (spill_skip) {
+        skip = iris_gpu_tensor_create(skip_host, (size_t)n);
+        free(skip_host);
+        skip_host = NULL;
+        if (!skip) {
+            iris_gpu_tensor_free(conv2_out);
+            return NULL;
+        }
+    }
 
     /* Residual: skip += conv_out */
-    iris_gpu_add_f32(skip, skip, conv1_out, n);
-    iris_gpu_tensor_free(conv1_out);
+    iris_gpu_add_f32(skip, skip, conv2_out, n);
+    iris_gpu_tensor_free(conv2_out);
 
     return skip;
 }
@@ -535,6 +584,14 @@ static iris_gpu_tensor_t resblock_forward_gpu(iris_gpu_tensor_t x,
 static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
                                    int batch, int latent_h, int latent_w) {
     if (!iris_metal_available()) return NULL;
+
+#ifdef USE_CUDA
+    /* Denoising leaves the stream-ordered pool split into transformer-sized
+     * blocks.  Return unused blocks to CUDA before the decoder starts making
+     * its much larger high-resolution activation allocations. */
+    if ((size_t)latent_h * (size_t)latent_w > 64 * 64)
+        iris_metal_reset_transient();
+#endif
 
     int ch_mult[4] = {1, 2, 4, 4};
 
@@ -601,7 +658,6 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
     int total_blocks = 3 + 4 * (vae->num_res_blocks + 1);
 
     t = resblock_forward_gpu(x, &vae->dec_mid_block1, batch, cur_h, cur_w, vae->num_groups, vae->eps);
-    iris_gpu_tensor_free(x);
     if (!t) { iris_gpu_batch_end(); return NULL; }
     x = t;
     if (iris_vae_progress_callback) iris_vae_progress_callback(progress++, total_blocks);
@@ -648,7 +704,6 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
 
     /* Mid block: resblock2 */
     t = resblock_forward_gpu(x, &vae->dec_mid_block2, batch, cur_h, cur_w, vae->num_groups, vae->eps);
-    iris_gpu_tensor_free(x);
     if (!t) { iris_gpu_batch_end(); return NULL; }
     x = t;
     if (iris_vae_progress_callback) iris_vae_progress_callback(progress++, total_blocks);
@@ -663,7 +718,6 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
         for (int r = 0; r < vae->num_res_blocks + 1; r++) {
             vae_resblock_t *block = &vae->dec_up_blocks[block_idx++];
             t = resblock_forward_gpu(x, block, batch, cur_h, cur_w, vae->num_groups, vae->eps);
-            iris_gpu_tensor_free(x);
             if (!t) { iris_gpu_batch_end(); return NULL; }
             x = t;
             if (iris_vae_progress_callback) iris_vae_progress_callback(progress++, total_blocks);
@@ -675,13 +729,31 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
             int new_h = cur_h * 2;
             int new_w = cur_w * 2;
 
+#ifdef USE_CUDA
+            /* Large decoder levels need contiguous multi-GiB allocations.
+             * Flush queued frees and defragment the async pool first. */
+            size_t upsample_bytes =
+                (size_t)batch * ch_out * new_h * new_w * sizeof(float);
+            if (upsample_bytes > 1024ULL * 1024 * 1024)
+                iris_metal_reset_transient();
+#endif
+
+#ifdef USE_CUDA
+            t = iris_gpu_upsample_conv2d_f32(
+                x, us->conv_weight, us->conv_bias,
+                batch, ch_out, cur_h, cur_w);
+            iris_gpu_tensor_free(x);
+            x = t;
+#else
             t = iris_gpu_upsample_nearest_2x_f32(x, ch_out, cur_h, cur_w);
             iris_gpu_tensor_free(x);
             if (!t) { iris_gpu_batch_end(); return NULL; }
 
             x = iris_gpu_conv2d_f32(t, us->conv_weight, us->conv_bias,
-                                     batch, ch_out, ch_out, new_h, new_w, 3, 3, 1, 1);
+                                     batch, ch_out, ch_out, new_h, new_w,
+                                     3, 3, 1, 1);
             iris_gpu_tensor_free(t);
+#endif
             if (!x) { iris_gpu_batch_end(); return NULL; }
 
             cur_h = new_h;
@@ -745,8 +817,9 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
 /* Decode latents back to an RGB image. Reverses the encode normalization
  * (Flux: batch denorm, Z-Image: x/scale + shift), unpatchifies, then runs
  * the decoder CNN (up_blocks double resolution 3 times). Converts the
- * float output to uint8 RGB. Tries GPU-resident decode first for speed,
- * falling back to CPU on failure. */
+ * float output to uint8 RGB. Tries GPU-resident decode first for speed.
+ * Metal can fall back to CPU; CUDA reports GPU failure directly because its
+ * full CPU attention fallback is not practical at high resolutions. */
 iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
                             int batch, int latent_h, int latent_w) {
 #if defined(USE_METAL) || defined(USE_CUDA)
@@ -754,6 +827,12 @@ iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
     if (iris_metal_available()) {
         iris_image *gpu_result = vae_decode_gpu(vae, latent, batch, latent_h, latent_w);
         if (gpu_result) return gpu_result;
+#ifdef USE_CUDA
+        /* A CUDA OOM leaves no realistic CPU fallback at high resolutions:
+         * bottleneck attention alone can require many GiB. Return a clean
+         * failure instead of entering that path. */
+        return NULL;
+#endif
         /* Fall through to CPU path on failure */
     }
 #endif

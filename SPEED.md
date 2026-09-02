@@ -194,6 +194,7 @@ about 3.6 GiB of process VRAM during denoising.
 - GPU-resident Qwen3 forward pass, computing only layers required for output extraction.
 - GPU-resident VAE decoder including bottleneck attention.
 - TF32 VAE convolution using direct 1x1 GEMM or a bounded 128 MiB im2col tile.
+- Fused nearest-neighbor upsample plus convolution, in-place residual-block normalization, and pressure-triggered exact residual spilling for maximum-resolution decoding on 8 GB cards.
 - Stream-ordered allocation through `cudaMallocAsync`/`cudaFreeAsync` with a compatibility fallback.
 - Bounded mmap BF16 weight retention: one fifth of VRAM, capped at 1.5 GiB, released before VAE decode.
 - Automatic CUDA architecture detection with `CUDA_ARCH` override for cross-compilation.
@@ -203,6 +204,7 @@ about 3.6 GiB of process VRAM during denoising.
 - 512x512, four steps: 5.4s -> 4.5s after GPU VAE attention and bounded weight retention.
 - 1024x1024, one step: 5.2s -> 4.1s; VAE decode 1.9s -> 1.0s.
 - 1280x1280, one step: 6.4s, remaining on the tiled cuBLAS attention path.
+- 1792x1792, four steps: 45.1s total with a 4.8s VAE decode on an RTX 3070 Ti.
 - Correctness: all three Flux regression tests pass with unchanged mean differences.
 - Memory safety: NVIDIA Compute Sanitizer reports zero errors on the CUDA smoke test.
 

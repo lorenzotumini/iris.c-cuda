@@ -490,6 +490,12 @@ fallback and multi-gigabyte score allocation that older versions encountered
 above approximately 1024 pixels. Runtime still grows quickly because attention
 compute is quadratic in the number of image tokens.
 
+The CUDA VAE also avoids materializing its largest nearest-neighbor upsample,
+reuses residual-block activation storage, and temporarily spills an exact
+residual branch to system RAM when VRAM pressure requires it. This makes the
+1792x1792 limit usable on an otherwise idle 8 GB card, with some additional
+decoder and PCIe time at the largest sizes.
+
 **Minimum resolution**: 64x64 pixels.
 
 Dimensions should be multiples of 16 (the VAE downsampling factor).
@@ -552,7 +558,7 @@ Important implementation details:
 - Q, K, and V remain in token-major, head-interleaved layout. Strided batched cuBLAS calls consume that layout directly, avoiding explicit head transposes.
 - Attention uses full matrices when they fit the 384 MiB workspace and query tiles otherwise. High-resolution runs stay on the cuBLAS/Tensor Core path.
 - Qwen3 remains on the GPU across its forward pass, with one synchronization at the end instead of per-layer CPU/GPU round trips.
-- The VAE decoder remains on the GPU, including bottleneck attention. Convolution uses TF32 cuBLAS with a bounded 128 MiB im2col tile and a direct path for 1x1 kernels.
+- The VAE decoder remains on the GPU, including bottleneck attention. Convolution uses TF32 cuBLAS with a bounded 128 MiB im2col tile and a direct path for 1x1 kernels; upsample-convolution is fused so its largest intermediate is never materialized.
 - Stream-ordered `cudaMallocAsync`/`cudaFreeAsync` avoids device-wide allocation synchronization when supported by the installed runtime.
 - In mmap mode, stable BF16 block weights are uploaded on demand. A bounded subset is retained across denoising steps and released before VAE decode.
 
@@ -638,10 +644,10 @@ CUDA memory is bounded in three important places:
 
 - Transformer attention uses a 384 MiB query-tiled workspace instead of a full quadratic allocation at high resolutions.
 - The mmap-backed BF16 transformer weight cache uses at most one fifth of total VRAM, capped at 1.5 GiB, and is released before VAE decode.
-- VAE convolution uses a tiled im2col buffer instead of materializing an unbounded convolution matrix.
+- VAE convolution uses a tiled im2col buffer, fuses nearest-neighbor upsampling with the following convolution, and reuses residual-block activations. Under extreme pressure, an exact residual branch is staged through system RAM.
 
-An 8 GB card is sufficient for the tested 4B txt2img workloads, including the
-one-step 1280x1280 stress test. Multi-reference generation and larger models
+An 8 GB card is sufficient for the tested 4B txt2img workloads, including
+1792x1792 on an otherwise idle RTX 3070 Ti. Multi-reference generation and larger models
 need more memory; the 9B and Z-Image CUDA paths have not been benchmarked on
 the 3070 Ti in this fork. Reduce `-W`/`-H`, use smaller reference images, and
 keep mmap enabled if you encounter an out-of-memory error.

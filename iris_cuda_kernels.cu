@@ -1353,6 +1353,40 @@ __global__ void im2col_f32_kernel(
     col[(size_t)k * count + p_local] = value;
 }
 
+/* Build im2col directly from a logical nearest-neighbor 2x upsample.  This
+ * avoids materializing the very large upsampled activation before the VAE's
+ * refinement convolution. */
+__global__ void im2col_upsample2x_f32_kernel(
+    const float *__restrict__ in,
+    float *__restrict__ col,
+    int in_ch, int in_h, int in_w,
+    int out_h, int out_w,
+    int kH, int kW, int padding,
+    int start, int count
+) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int kernel_elems = in_ch * kH * kW;
+    int total = kernel_elems * count;
+    if (idx >= total) return;
+
+    int p_local = idx % count;
+    int k = idx / count;
+    int p = start + p_local;
+    int ox = p % out_w;
+    int oy = p / out_w;
+    int kx = k % kW;
+    int t = k / kW;
+    int ky = t % kH;
+    int ic = t / kH;
+    int up_y = oy - padding + ky;
+    int up_x = ox - padding + kx;
+
+    float value = 0.0f;
+    if (up_y >= 0 && up_y < out_h && up_x >= 0 && up_x < out_w)
+        value = in[(ic * in_h + up_y / 2) * in_w + up_x / 2];
+    col[(size_t)k * count + p_local] = value;
+}
+
 __global__ void add_bias_nchw_f32_kernel(float *out, const float *bias,
                                           int batch, int channels, int spatial) {
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
@@ -1654,6 +1688,20 @@ int launch_im2col_f32(const float *in, float *col, int in_ch, int in_h, int in_w
     int threads = 256;
     int blocks = (int)((total + threads - 1) / threads);
     im2col_f32_kernel<<<blocks, threads, 0, stream>>>(in, col, in_ch, in_h, in_w, out_h, out_w, kH, kW, stride, padding, start, count);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+int launch_im2col_upsample2x_f32(const float *in, float *col,
+                                  int in_ch, int in_h, int in_w,
+                                  int out_h, int out_w, int kH, int kW,
+                                  int padding, int start, int count,
+                                  cudaStream_t stream) {
+    int64_t total = (int64_t)in_ch * kH * kW * count;
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    im2col_upsample2x_f32_kernel<<<blocks, threads, 0, stream>>>(
+        in, col, in_ch, in_h, in_w, out_h, out_w,
+        kH, kW, padding, start, count);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 

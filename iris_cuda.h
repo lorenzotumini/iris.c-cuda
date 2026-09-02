@@ -145,6 +145,7 @@ int iris_cuda_in_batch(void);
 int iris_metal_in_batch(void);
 
 size_t iris_cuda_memory_used(void);
+size_t iris_cuda_memory_free(void);
 size_t iris_metal_memory_used(void);
 
 /* ========================================================================
@@ -333,6 +334,12 @@ void iris_gpu_add_f32(iris_gpu_tensor_t out, iris_gpu_tensor_t a, iris_gpu_tenso
 
 iris_gpu_tensor_t iris_gpu_upsample_nearest_2x_f32(iris_gpu_tensor_t x,
                                                      int channels, int H, int W);
+
+iris_gpu_tensor_t iris_gpu_upsample_conv2d_f32(iris_gpu_tensor_t x,
+                                                const float *weight,
+                                                const float *bias,
+                                                int batch, int channels,
+                                                int H, int W);
 
 iris_gpu_tensor_t iris_gpu_conv2d_f32(iris_gpu_tensor_t x,
                                        const float *weight, const float *bias,

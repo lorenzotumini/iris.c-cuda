@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+extern "C" void iris_softmax_cpu(float *x, int rows, int cols);
+
 /* Forward declarations of CUDA kernel entry points from iris_cuda_kernels.cu */
 extern "C" {
 void launch_rms_norm_f32(const float *x, const float *weight, float *out, int seq, int hidden, float eps, cudaStream_t stream);
@@ -67,6 +69,11 @@ void launch_nhwc_to_nchw_f32(const float *in, float *out, int batch, int channel
 void launch_upsample_nearest_2x_f32(const float *x, float *out, int channels, int in_h, int in_w, cudaStream_t stream);
 void launch_conv2d_f32(const float *in, const float *weight, const float *bias, float *out, int batch, int in_ch, int out_ch, int in_h, int in_w, int out_h, int out_w, int kH, int kW, int stride, int padding, cudaStream_t stream);
 int launch_im2col_f32(const float *in, float *col, int in_ch, int in_h, int in_w, int out_h, int out_w, int kH, int kW, int stride, int padding, int start, int count, cudaStream_t stream);
+int launch_im2col_upsample2x_f32(const float *in, float *col,
+                                 int in_ch, int in_h, int in_w,
+                                 int out_h, int out_w, int kH, int kW,
+                                 int padding, int start, int count,
+                                 cudaStream_t stream);
 void launch_add_bias_nchw_f32(float *out, const float *bias, int batch, int channels, int spatial, cudaStream_t stream);
 } /* extern "C" */
 
@@ -361,6 +368,7 @@ void iris_metal_reset(void) { iris_cuda_reset(); }
 void iris_metal_rope_cache_begin(void) {}
 void iris_metal_reset_transient(void) {
     if (g_stream) cudaStreamSynchronize(g_stream);
+    if (g_mem_pool) cudaMemPoolTrimTo(g_mem_pool, 0);
 }
 
 void iris_metal_clear_weight_cache_only(void) { iris_cuda_reset(); }
@@ -398,6 +406,12 @@ size_t iris_cuda_memory_used(void) {
     if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
         return total_b - free_b;
     }
+    return 0;
+}
+
+size_t iris_cuda_memory_free(void) {
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) return free_b;
     return 0;
 }
 
@@ -439,6 +453,13 @@ iris_gpu_tensor_t iris_gpu_tensor_alloc(size_t num_elements) {
     cudaError_t err = device_alloc(&tensor->device_ptr, tensor->bytes,
                                    &tensor->async_alloc);
     if (err != cudaSuccess || !tensor->device_ptr) {
+        size_t free_bytes = 0, total_bytes = 0;
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        fprintf(stderr, "CUDA tensor allocation failed: %.1f MiB requested, "
+                        "%.1f/%.1f MiB free (%s)\n",
+                tensor->bytes / (1024.0 * 1024.0),
+                free_bytes / (1024.0 * 1024.0),
+                total_bytes / (1024.0 * 1024.0), cudaGetErrorString(err));
         free(tensor);
         return NULL;
     }
@@ -895,7 +916,11 @@ void iris_gpu_copy_bf16(iris_gpu_tensor_t dst, iris_gpu_tensor_t src, size_t n) 
 }
 
 void iris_metal_softmax(float *x, int rows, int cols) {
-    iris_gpu_tensor_t tx = iris_gpu_tensor_create(x, rows * cols);
+    iris_gpu_tensor_t tx = iris_gpu_tensor_create(x, (size_t)rows * (size_t)cols);
+    if (!tx) {
+        iris_softmax_cpu(x, rows, cols);
+        return;
+    }
     launch_softmax_f32((float *)tx->device_ptr, rows, cols, g_stream);
     iris_gpu_tensor_read(tx, x);
     iris_gpu_tensor_free(tx);
@@ -1343,6 +1368,63 @@ static int conv2d_im2col_f32(const float *d_in, const float *d_weight,
     return ok;
 }
 
+/* Convolve a logical nearest-neighbor 2x upsample without allocating the
+ * intermediate upsampled tensor. */
+static int conv2d_upsample2x_im2col_f32(
+        const float *d_in, const float *d_weight, const float *d_bias,
+        float *d_out, int batch, int channels, int H, int W) {
+    const int out_h = H * 2;
+    const int out_w = W * 2;
+    const int spatial = out_h * out_w;
+    const int kernel_elems = channels * 3 * 3;
+    const size_t tile_budget = 128ULL * 1024 * 1024;
+    int tile = (int)(tile_budget / ((size_t)kernel_elems * sizeof(float)));
+    if (tile < 1) tile = 1;
+    if (tile > spatial) tile = spatial;
+
+    void *d_col = NULL;
+    int col_async = 0;
+    if (device_alloc(&d_col, (size_t)kernel_elems * tile * sizeof(float),
+                     &col_async) != cudaSuccess) return 0;
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    int ok = 1;
+    for (int b = 0; b < batch && ok; b++) {
+        const float *in_b = d_in + (size_t)b * channels * H * W;
+        float *out_b = d_out + (size_t)b * channels * spatial;
+        for (int start = 0; start < spatial; start += tile) {
+            int count = spatial - start;
+            if (count > tile) count = tile;
+            if (!launch_im2col_upsample2x_f32(
+                    in_b, (float *)d_col, channels, H, W, out_h, out_w,
+                    3, 3, 1, start, count, g_stream)) {
+                ok = 0;
+                break;
+            }
+            cublasStatus_t status = cublasGemmEx(
+                g_cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                count, channels, kernel_elems,
+                &alpha,
+                d_col, CUDA_R_32F, count,
+                d_weight, CUDA_R_32F, kernel_elems,
+                &beta,
+                out_b + start, CUDA_R_32F, spatial,
+                CUBLAS_COMPUTE_32F_FAST_TF32,
+                CUBLAS_GEMM_DEFAULT);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                ok = 0;
+                break;
+            }
+        }
+    }
+
+    device_free(d_col, col_async);
+    if (ok && d_bias)
+        launch_add_bias_nchw_f32(d_out, d_bias, batch, channels, spatial, g_stream);
+    return ok;
+}
+
 int iris_cuda_conv2d(float *out, const float *in, const float *weight, const float *bias, int batch, int in_ch, int out_ch, int H, int W, int kH, int kW, int stride, int padding) {
     int out_h = (H + 2 * padding - kH) / stride + 1;
     int out_w = (W + 2 * padding - kW) / stride + 1;
@@ -1401,6 +1483,30 @@ iris_gpu_tensor_t iris_gpu_conv2d_f32(iris_gpu_tensor_t x, const float *weight, 
                           (const float *)d_b, (float *)out->device_ptr,
                           batch, in_ch, out_ch, H, W, out_h, out_w,
                           kH, kW, stride, padding, g_stream);
+    }
+    return out;
+}
+
+iris_gpu_tensor_t iris_gpu_upsample_conv2d_f32(
+        iris_gpu_tensor_t x, const float *weight, const float *bias,
+        int batch, int channels, int H, int W) {
+    const int out_h = H * 2;
+    const int out_w = W * 2;
+    iris_gpu_tensor_t out = iris_gpu_tensor_alloc(
+        (size_t)batch * channels * out_h * out_w);
+    if (!out) return NULL;
+
+    void *d_w = get_or_create_cached_weight(
+        weight, (size_t)channels * channels * 3 * 3 * sizeof(float));
+    void *d_b = bias ? get_or_create_cached_weight(
+        bias, (size_t)channels * sizeof(float)) : NULL;
+    if (!d_w || (bias && !d_b) ||
+        !conv2d_upsample2x_im2col_f32(
+            (const float *)x->device_ptr, (const float *)d_w,
+            (const float *)d_b, (float *)out->device_ptr,
+            batch, channels, H, W)) {
+        iris_gpu_tensor_free(out);
+        return NULL;
     }
     return out;
 }
