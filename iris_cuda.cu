@@ -796,6 +796,31 @@ iris_gpu_tensor_t iris_gpu_linear(iris_gpu_tensor_t x, const float *W, const flo
     return out;
 }
 
+int iris_gpu_linear_f32_into(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
+                             const float *W, int seq_len,
+                             int in_dim, int out_dim) {
+    if (!iris_cuda_available() || !out || !x || !W ||
+        out->is_f16 || x->is_f16) {
+        return 0;
+    }
+
+    void *d_W = get_or_create_cached_weight(
+        W, (size_t)out_dim * in_dim * sizeof(float));
+    if (!d_W) return 0;
+
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    cublasStatus_t status = cublasSgemm(
+        g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+        out_dim, seq_len, in_dim,
+        &alpha,
+        (const float *)d_W, in_dim,
+        (const float *)x->device_ptr, in_dim,
+        &beta,
+        (float *)out->device_ptr, out_dim);
+    return status == CUBLAS_STATUS_SUCCESS;
+}
+
 /* ========================================================================
  * Kernel Dispatch Wrappers
  * ======================================================================== */

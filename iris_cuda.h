@@ -173,6 +173,11 @@ iris_gpu_tensor_t iris_gpu_linear(iris_gpu_tensor_t x,
                                    const float *W, const float *b,
                                    int seq_len, int in_dim, int out_dim);
 
+/* F32 linear projection into an existing tensor. */
+int iris_gpu_linear_f32_into(iris_gpu_tensor_t out, iris_gpu_tensor_t x,
+                             const float *W, int seq_len,
+                             int in_dim, int out_dim);
+
 iris_gpu_tensor_t iris_gpu_linear_bf16(iris_gpu_tensor_t x,
                                         const uint16_t *W_bf16,
                                         int seq_len, int in_dim, int out_dim);

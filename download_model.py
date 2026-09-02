@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Download FLUX.2-klein model files from HuggingFace.
+Download supported Iris model files from HuggingFace.
 
 Usage:
     python download_model.py MODEL [--token TOKEN] [--output-dir DIR]
@@ -24,7 +24,7 @@ MODELS = {
 }
 
 USAGE_TEXT = """\
-FLUX.2-klein Model Downloader
+Iris Model Downloader
 
 Usage: python download_model.py MODEL [--token TOKEN] [--output-dir DIR]
 
@@ -34,7 +34,7 @@ Available models:
   4b-base       Base 4B (50 steps, CFG, higher quality, ~16 GB disk)
   9b            Distilled 9B (4 steps, higher quality, non-commercial, ~30 GB disk)
   9b-base       Base 9B (50 steps, CFG, highest quality, non-commercial, ~30 GB disk)
-  zimage-turbo  Z-Image-Turbo 6B (8 NFE / 9 scheduler steps, Apache 2.0, ~22 GB disk)
+  zimage-turbo  Z-Image-Turbo 6B (8 NFE / 9 scheduler steps, Apache 2.0, ~31 GB disk)
 
 By default this implementation uses mmap() so inference is often
 possible with less RAM than the model size.
@@ -49,12 +49,12 @@ def main():
         return 1
 
     parser = argparse.ArgumentParser(
-        description='Download FLUX.2-klein model files from HuggingFace'
+        description='Download supported Iris model files from HuggingFace'
     )
     parser.add_argument(
         'model',
         choices=list(MODELS.keys()),
-        help='Model to download (4b, 4b-base, 9b, 9b-base)'
+        help='Model to download (4b, 4b-base, 9b, 9b-base, zimage-turbo)'
     )
     parser.add_argument(
         '--output-dir', '-o',
@@ -84,7 +84,7 @@ def main():
     repo_id, default_dir = MODELS[args.model]
     output_dir = Path(args.output_dir if args.output_dir else default_dir)
 
-    print(f"FLUX.2 Model Downloader")
+    print("Iris Model Downloader")
     print("================================")
     print()
     print(f"Repository: {repo_id}")
@@ -123,7 +123,7 @@ def main():
 
         # Show file sizes
         vae_path = output_dir / "vae" / "diffusion_pytorch_model.safetensors"
-        tf_path = output_dir / "transformer" / "diffusion_pytorch_model.safetensors"
+        tf_dir = output_dir / "transformer"
         te_path = output_dir / "text_encoder"
 
         total_size = 0
@@ -131,8 +131,9 @@ def main():
             vae_size = vae_path.stat().st_size
             total_size += vae_size
             print(f"  VAE:          {vae_size / 1024 / 1024:.1f} MB")
-        if tf_path.exists():
-            tf_size = tf_path.stat().st_size
+        tf_files = list(tf_dir.glob("*.safetensors")) if tf_dir.exists() else []
+        if tf_files:
+            tf_size = sum(f.stat().st_size for f in tf_files)
             total_size += tf_size
             print(f"  Transformer:  {tf_size / 1024 / 1024 / 1024:.2f} GB")
         if te_path.exists():
@@ -144,7 +145,7 @@ def main():
             print(f"  Total:        {total_size / 1024 / 1024 / 1024:.2f} GB")
         print()
         print("Usage:")
-        print(f"  ./flux -d {output_dir} -p \"your prompt\" -o output.png")
+        print(f"  ./iris -d {output_dir} -p \"your prompt\" -o output.png")
         print()
 
     except Exception as e:

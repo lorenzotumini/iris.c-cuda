@@ -376,6 +376,7 @@ float *iris_sample_euler_zimage(void *transformer,
     int latent_size = batch * channels * h * w;
 
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
+    if (!z_curr) return NULL;
     iris_copy(z_curr, z, latent_size);
 
     iris_reset_timing();
@@ -417,6 +418,13 @@ float *iris_sample_euler_zimage(void *transformer,
         float *model_out = iris_transformer_forward_zimage(tf, z_curr, h, w,
                                                     timestep,
                                                     cap_feats, cap_seq);
+        if (!model_out) {
+            fprintf(stderr, "Z-Image sampling aborted at step %d/%d\n",
+                    step + 1, num_steps);
+            free(step_latent);
+            free(z_curr);
+            return NULL;
+        }
 
         /* Euler step: z_next = z + dt * (-model_output) */
         for (int i = 0; i < latent_size; i++) {

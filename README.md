@@ -56,7 +56,7 @@ If you want to try the 9B model (higher quality, non-commercial license, ~30GB d
 
 For Z-Image-Turbo:
 ```bash
-# Download Z-Image-Turbo (~12GB)
+# Download Z-Image-Turbo (~31GB for the current official FP32 snapshot)
 pip install huggingface_hub && python download_model.py zimage-turbo
 ./iris -d zimage-turbo -p "a fish" -o fish.png
 ```
@@ -408,7 +408,7 @@ Download model weights from HuggingFace using one of these methods:
 # You can also set the HF_TOKEN environment variable
 ```
 
-**Z-Image-Turbo** (~12GB):
+**Z-Image-Turbo** (~31GB):
 ```bash
 pip install huggingface_hub && python download_model.py zimage-turbo
 ```
@@ -419,7 +419,7 @@ pip install huggingface_hub && python download_model.py zimage-turbo
 | 4B base | `./flux-klein-4b-base` | ~16GB | VAE (~160MB), Transformer (~7.3GB), Qwen3-4B (~7.5GB) |
 | 9B distilled | `./flux-klein-9b` | ~30GB | VAE (~300MB), Transformer (~17GB), Qwen3-8B (~15GB) |
 | 9B base | `./flux-klein-9b-base` | ~30GB | VAE (~300MB), Transformer (~17GB), Qwen3-8B (~15GB) |
-| Z-Image-Turbo | `./zimage-turbo` | ~12GB | VAE, Transformer (~6B), Qwen3-4B |
+| Z-Image-Turbo | `./zimage-turbo` | ~31GB | VAE (~160MB), FP32 Transformer (~23GB), Qwen3-4B (~7.5GB) |
 
 ## How Fast Is It?
 
@@ -546,9 +546,11 @@ Z-Image-Turbo uses an S3-DiT single-stream architecture with noise and context r
 
 ## CUDA Backend Design
 
-The CUDA backend uses the model's BF16 weights directly and keeps transformer
+The FLUX CUDA path uses the model's BF16 weights directly and keeps transformer
 activations in BF16 so Ampere Tensor Cores can accelerate the large matrix
-products. Attention logits and softmax remain in FP32; normalized
+products. Z-Image also supports direct BF16 checkpoints; its current official
+FP32 checkpoint is streamed without an up-front conversion. Attention logits
+and softmax remain in FP32; normalized
 probabilities are narrowed to BF16 only for the value projection. This keeps
 the output within the repository's reference tolerance without expanding all
 weights to FP32 in VRAM.
@@ -560,10 +562,11 @@ Important implementation details:
 - Qwen3 remains on the GPU across its forward pass, with one synchronization at the end instead of per-layer CPU/GPU round trips.
 - The VAE decoder remains on the GPU, including bottleneck attention. Convolution uses TF32 cuBLAS with a bounded 128 MiB im2col tile and a direct path for 1x1 kernels; upsample-convolution is fused so its largest intermediate is never materialized.
 - Stream-ordered `cudaMallocAsync`/`cudaFreeAsync` avoids device-wide allocation synchronization when supported by the installed runtime.
-- In mmap mode, stable BF16 block weights are uploaded on demand. A bounded subset is retained across denoising steps and released before VAE decode.
+- In mmap mode, stable FLUX BF16 block weights are uploaded on demand and a bounded subset is retained across denoising steps. Z-Image's FP32 or BF16 block matrices are streamed without duplicating the full model in host RAM.
 
-The backend contains scalar fallbacks for allocation or cuBLAS failures, but
-normal Ampere execution should report BF16 GPU acceleration in verbose output.
+The backend contains scalar fallbacks for allocation or cuBLAS failures. In
+verbose output, FLUX reports BF16 acceleration while the official Z-Image
+checkpoint reports `CUDA F32 mmap streaming enabled`.
 
 ## Timestep Schedules
 
@@ -652,6 +655,16 @@ need more memory; the 9B and Z-Image CUDA paths have not been benchmarked on
 the 3070 Ti in this fork. Reduce `-W`/`-H`, use smaller reference images, and
 keep mmap enabled if you encounter an out-of-memory error.
 
+The current official Z-Image-Turbo snapshot stores its roughly 6B transformer
+parameters as FP32, so its transformer files alone occupy about 23GB. On CUDA,
+Iris keeps those files mapped and uploads one block at a time; it does not
+expand or duplicate the complete transformer during loading. Linux may retain
+recently read model pages as reclaimable filesystem cache, so system monitors
+can still show substantial "used" RAM after a denoising step. BF16-converted
+Z-Image checkpoints are also streamed directly when available. If the Z-Image
+CUDA path fails, generation stops with a stage/block diagnostic instead of
+silently starting the much slower, memory-heavy CPU transformer.
+
 ### 4B model
 
 With mmap (default):
@@ -710,7 +723,7 @@ This reduces peak host memory from ~16GB to ~4-5GB, making inference possible on
 
 - **MPS (Apple Silicon):** mmap is the **fastest** mode. The model stores weights in bf16 format, and MPS uses them directly via zero-copy pointers into the memory-mapped region. No conversion overhead, and the kernel handles paging efficiently.
 
-- **CUDA (NVIDIA):** mmap is the recommended mode, especially on 8 GB cards. BF16 weights are streamed to the GPU block by block, while a bounded subset remains resident across denoising steps to avoid repeated PCIe transfers. The retained subset is released before VAE decode.
+- **CUDA (NVIDIA):** mmap is the recommended mode, especially on 8 GB cards. FLUX BF16 weights use a bounded streaming cache. Z-Image streams its official FP32 matrices one block at a time (or uses BF16 directly for converted checkpoints), avoiding a whole-model host conversion and keeping only the active block in VRAM. Retained FLUX weights are released before VAE decode.
 
 - **BLAS (CPU):** mmap is **slightly slower** but uses much less RAM. BLAS requires f32 weights, so each block must be converted from bf16->f32 on every step (25 blocks x 4 steps = 100 conversions). With `--no-mmap`, this conversion happens once at startup. **Recommendation:** If you have 32GB+ RAM and use BLAS, try `--no-mmap` for faster inference. If RAM is limited, mmap lets you run at all.
 
