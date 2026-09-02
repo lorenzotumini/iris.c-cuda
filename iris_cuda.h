@@ -43,6 +43,10 @@ void iris_metal_reset(void);
 /* Remove cached copies associated with a host allocation.  CUDA uses this to
  * stream mmap-backed layer weights without flushing unrelated cache entries. */
 void iris_cuda_invalidate_weight(const void *host_ptr);
+/* Keep stable mmap-backed weights resident within a bounded device budget
+ * across denoising steps, then release the retained subset as a group. */
+void iris_cuda_release_streaming_weight(const void *host_ptr);
+void iris_cuda_clear_streaming_weights(void);
 void iris_metal_rope_cache_begin(void);
 void iris_metal_reset_transient(void);
 
@@ -335,6 +339,17 @@ iris_gpu_tensor_t iris_gpu_conv2d_f32(iris_gpu_tensor_t x,
                                        int batch, int in_ch, int out_ch,
                                        int H, int W, int kH, int kW,
                                        int stride, int padding);
+
+/* VAE bottleneck attention, including normalization, QKV/output 1x1
+ * projections, layout conversion, and residual add, entirely on GPU. */
+iris_gpu_tensor_t iris_gpu_vae_attention_f32(
+    iris_gpu_tensor_t x,
+    const float *norm_weight, const float *norm_bias,
+    const float *q_weight, const float *q_bias,
+    const float *k_weight, const float *k_bias,
+    const float *v_weight, const float *v_bias,
+    const float *out_weight, const float *out_bias,
+    int batch, int channels, int H, int W, int num_groups, float eps);
 
 void iris_gpu_copy_f32(iris_gpu_tensor_t dst, iris_gpu_tensor_t src, size_t n);
 

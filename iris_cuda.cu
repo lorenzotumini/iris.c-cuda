@@ -10,6 +10,7 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <cuda_bf16.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,6 +62,8 @@ int launch_causal_attention_fused_bf16(const uint16_t *Q, const uint16_t *K, con
 
 void launch_group_norm_f32(const float *x, const float *gamma, const float *beta, float *out, int batch, int channels, int spatial, int channels_per_group, float eps, cudaStream_t stream);
 void launch_swish_f32(const float *x, float *out, int n, cudaStream_t stream);
+void launch_nchw_to_nhwc_f32(const float *in, float *out, int batch, int channels, int spatial, cudaStream_t stream);
+void launch_nhwc_to_nchw_f32(const float *in, float *out, int batch, int channels, int spatial, cudaStream_t stream);
 void launch_upsample_nearest_2x_f32(const float *x, float *out, int channels, int in_h, int in_w, cudaStream_t stream);
 void launch_conv2d_f32(const float *in, const float *weight, const float *bias, float *out, int batch, int in_ch, int out_ch, int in_h, int in_w, int out_h, int out_w, int kH, int kW, int stride, int padding, cudaStream_t stream);
 int launch_im2col_f32(const float *in, float *col, int in_ch, int in_h, int in_w, int out_h, int out_w, int kH, int kW, int stride, int padding, int start, int count, cudaStream_t stream);
@@ -95,10 +98,13 @@ typedef struct {
     void *device_ptr;
     size_t bytes;
     int async_alloc;
+    int streaming_retained;
 } weight_cache_entry_t;
 
 static weight_cache_entry_t g_weight_cache[MAX_WEIGHT_CACHE];
 static int g_weight_cache_count = 0;
+static size_t g_streaming_cache_bytes = 0;
+static size_t g_streaming_cache_budget = 0;
 
 typedef struct {
     void *ptr;
@@ -177,6 +183,7 @@ static void *get_or_create_cached_weight(const void *host_ptr, size_t bytes) {
     g_weight_cache[g_weight_cache_count].device_ptr = device_ptr;
     g_weight_cache[g_weight_cache_count].bytes = bytes;
     g_weight_cache[g_weight_cache_count].async_alloc = async_alloc;
+    g_weight_cache[g_weight_cache_count].streaming_retained = 0;
     g_weight_cache_count++;
 
     return device_ptr;
@@ -189,10 +196,47 @@ void iris_cuda_invalidate_weight(const void *host_ptr) {
             i++;
             continue;
         }
+        if (g_weight_cache[i].streaming_retained) {
+            if (g_weight_cache[i].bytes <= g_streaming_cache_bytes)
+                g_streaming_cache_bytes -= g_weight_cache[i].bytes;
+            else
+                g_streaming_cache_bytes = 0;
+        }
         device_free(g_weight_cache[i].device_ptr, g_weight_cache[i].async_alloc);
         g_weight_cache[i] = g_weight_cache[g_weight_cache_count - 1];
         g_weight_cache_count--;
     }
+}
+
+void iris_cuda_release_streaming_weight(const void *host_ptr) {
+    if (!host_ptr) return;
+    for (int i = 0; i < g_weight_cache_count; i++) {
+        weight_cache_entry_t *entry = &g_weight_cache[i];
+        if (entry->host_ptr != host_ptr) continue;
+        if (entry->streaming_retained) return;
+        if (entry->bytes <= g_streaming_cache_budget -
+                            g_streaming_cache_bytes) {
+            entry->streaming_retained = 1;
+            g_streaming_cache_bytes += entry->bytes;
+            return;
+        }
+        break;
+    }
+    iris_cuda_invalidate_weight(host_ptr);
+}
+
+void iris_cuda_clear_streaming_weights(void) {
+    for (int i = 0; i < g_weight_cache_count; ) {
+        if (!g_weight_cache[i].streaming_retained) {
+            i++;
+            continue;
+        }
+        device_free(g_weight_cache[i].device_ptr,
+                    g_weight_cache[i].async_alloc);
+        g_weight_cache[i] = g_weight_cache[g_weight_cache_count - 1];
+        g_weight_cache_count--;
+    }
+    g_streaming_cache_bytes = 0;
 }
 
 /* ========================================================================
@@ -209,6 +253,20 @@ int iris_cuda_init(void) {
     }
 
     cudaSetDevice(0);
+
+    /* Retain at most one fifth of VRAM, capped at 1.5 GiB, for stable
+     * mmap-backed transformer weights.  On an 8 GiB card this leaves ample
+     * room for 1024px activations and the bounded attention workspace. */
+    cudaDeviceProp props;
+    if (cudaGetDeviceProperties(&props, 0) == cudaSuccess) {
+        g_streaming_cache_budget = props.totalGlobalMem / 5;
+        const size_t cap = 1536ULL * 1024 * 1024;
+        if (g_streaming_cache_budget > cap)
+            g_streaming_cache_budget = cap;
+    } else {
+        g_streaming_cache_budget = 0;
+        cudaGetLastError();
+    }
 
     if (cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking) != cudaSuccess) {
         return 0;
@@ -294,6 +352,7 @@ void iris_cuda_reset(void) {
         }
     }
     g_weight_cache_count = 0;
+    g_streaming_cache_bytes = 0;
     if (g_stream) cudaStreamSynchronize(g_stream);
     if (g_mem_pool) cudaMemPoolTrimTo(g_mem_pool, 0);
 }
@@ -945,51 +1004,74 @@ static int attention_cublas_f32(float *out, const float *Q, const float *K,
     if (!out || !Q || !K || !V || seq_q <= 0 || seq_k <= 0 ||
         num_heads <= 0 || head_dim <= 0) return 0;
 
-    size_t score_elements = (size_t)num_heads * (size_t)seq_q * (size_t)seq_k;
-    if (score_elements > ((size_t)2 << 30) / sizeof(float)) return 0;
+    /* Keep the score matrix bounded.  A full 1024px Flux attention matrix is
+     * already around 1.8 GiB in f32, and grows quadratically with resolution.
+     * Attention rows are independent, so process a query tile at a time while
+     * retaining the same cuBLAS GEMMs and numerically identical softmax. */
+    const size_t workspace_budget = 384ULL * 1024 * 1024;
+    const size_t bytes_per_query =
+        (size_t)num_heads * (size_t)seq_k * sizeof(float);
+    int tile_q = bytes_per_query ? (int)(workspace_budget / bytes_per_query) : 0;
+    if (tile_q < 1) tile_q = 1;
+    if (tile_q > seq_q) tile_q = seq_q;
+    if (tile_q > 128 && tile_q < seq_q) tile_q = (tile_q / 128) * 128;
 
+    size_t score_elements = 0;
     int scores_async = 0;
     float *scores = NULL;
-    if (device_alloc((void **)&scores, score_elements * sizeof(float),
-                     &scores_async) != cudaSuccess) {
-        return 0;
+    while (tile_q >= 1) {
+        score_elements = (size_t)num_heads * (size_t)tile_q * (size_t)seq_k;
+        if (device_alloc((void **)&scores, score_elements * sizeof(float),
+                         &scores_async) == cudaSuccess) break;
+        tile_q /= 2;
+        if (tile_q > 128) tile_q = (tile_q / 128) * 128;
     }
+    if (!scores) return 0;
 
     const int hidden = num_heads * head_dim;
     const long long head_stride = head_dim;
-    const long long score_stride = (long long)seq_q * seq_k;
     const float zero = 0.0f;
     const float one = 1.0f;
 
-    /* scores[head, query, key] = scale * Q * K^T.  Scores are emitted as
-     * column-major [key, query], which is the same memory layout as the
-     * desired row-major [query, key] softmax input. */
-    cublasStatus_t status = cublasGemmStridedBatchedEx(
-        g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-        seq_k, seq_q, head_dim,
-        &scale,
-        K, CUDA_R_32F, hidden, head_stride,
-        Q, CUDA_R_32F, hidden, head_stride,
-        &zero,
-        scores, CUDA_R_32F, seq_k, score_stride,
-        num_heads,
-        CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT);
+    cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+    for (int query_start = 0; query_start < seq_q &&
+         status == CUBLAS_STATUS_SUCCESS; query_start += tile_q) {
+        int query_count = seq_q - query_start;
+        if (query_count > tile_q) query_count = tile_q;
+        const long long score_stride = (long long)query_count * seq_k;
+        const float *q_tile = Q + (size_t)query_start * hidden;
+        float *out_tile = out + (size_t)query_start * hidden;
 
-    if (status == CUBLAS_STATUS_SUCCESS) {
-        launch_softmax_f32(scores, num_heads * seq_q, seq_k, g_stream);
-
-        /* out^T = V^T * softmax(scores)^T, written directly back into the
-         * original token-major, head-interleaved output layout. */
+        /* scores[head, query, key] = scale * Q * K^T.  Scores are emitted as
+         * column-major [key, query], the desired row-major [query, key]
+         * softmax layout. */
         status = cublasGemmStridedBatchedEx(
-            g_cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-            head_dim, seq_q, seq_k,
-            &one,
-            V, CUDA_R_32F, hidden, head_stride,
-            scores, CUDA_R_32F, seq_k, score_stride,
+            g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            seq_k, query_count, head_dim,
+            &scale,
+            K, CUDA_R_32F, hidden, head_stride,
+            q_tile, CUDA_R_32F, hidden, head_stride,
             &zero,
-            out, CUDA_R_32F, hidden, head_stride,
+            scores, CUDA_R_32F, seq_k, score_stride,
             num_heads,
             CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT);
+
+        if (status == CUBLAS_STATUS_SUCCESS) {
+            launch_softmax_f32(scores, num_heads * query_count, seq_k, g_stream);
+
+            /* out^T = V^T * softmax(scores)^T, written directly into the
+             * corresponding token-major output rows. */
+            status = cublasGemmStridedBatchedEx(
+                g_cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                head_dim, query_count, seq_k,
+                &one,
+                V, CUDA_R_32F, hidden, head_stride,
+                scores, CUDA_R_32F, seq_k, score_stride,
+                &zero,
+                out_tile, CUDA_R_32F, hidden, head_stride,
+                num_heads,
+                CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT);
+        }
     }
 
     int ok = status == CUBLAS_STATUS_SUCCESS &&
@@ -1005,54 +1087,82 @@ static int attention_cublas_bf16(uint16_t *out, const uint16_t *Q,
     if (!out || !Q || !K || !V || seq_q <= 0 || seq_k <= 0 ||
         num_heads <= 0 || head_dim <= 0) return 0;
 
-    size_t score_elements = (size_t)num_heads * (size_t)seq_q * (size_t)seq_k;
-    if (score_elements > ((size_t)2 << 30) / sizeof(float)) return 0;
+    /* f32 logits plus bf16 probabilities use six bytes per score.  Bound the
+     * workspace and tile queries so high-resolution generations stay on the
+     * Tensor Core path instead of falling back to the scalar attention
+     * kernel when a multi-gigabyte allocation is not possible. */
+    const size_t workspace_budget = 384ULL * 1024 * 1024;
+    const size_t bytes_per_query =
+        (size_t)num_heads * (size_t)seq_k *
+        (sizeof(float) + sizeof(uint16_t));
+    int tile_q = bytes_per_query ? (int)(workspace_budget / bytes_per_query) : 0;
+    if (tile_q < 1) tile_q = 1;
+    if (tile_q > seq_q) tile_q = seq_q;
+    if (tile_q > 128 && tile_q < seq_q) tile_q = (tile_q / 128) * 128;
 
+    size_t score_elements = 0;
     int scores_async = 0, probs_async = 0;
     float *scores = NULL;
     uint16_t *probs = NULL;
-    if (device_alloc((void **)&scores, score_elements * sizeof(float),
-                     &scores_async) != cudaSuccess ||
-        device_alloc((void **)&probs, score_elements * sizeof(uint16_t),
-                     &probs_async) != cudaSuccess) {
+    while (tile_q >= 1) {
+        score_elements = (size_t)num_heads * (size_t)tile_q * (size_t)seq_k;
+        if (device_alloc((void **)&scores, score_elements * sizeof(float),
+                         &scores_async) == cudaSuccess &&
+            device_alloc((void **)&probs, score_elements * sizeof(uint16_t),
+                         &probs_async) == cudaSuccess) break;
         if (scores) device_free(scores, scores_async);
         if (probs) device_free(probs, probs_async);
-        return 0;
+        scores = NULL;
+        probs = NULL;
+        tile_q /= 2;
+        if (tile_q > 128) tile_q = (tile_q / 128) * 128;
     }
+    if (!scores || !probs) return 0;
 
     const int hidden = num_heads * head_dim;
     const long long head_stride = head_dim;
-    const long long score_stride = (long long)seq_q * seq_k;
     const float zero = 0.0f;
     const float one = 1.0f;
 
-    /* Accumulate and normalize logits in f32.  Only the normalized
-     * probabilities are narrowed to bf16 for the Tensor Core V product. */
-    cublasStatus_t status = cublasGemmStridedBatchedEx(
-        g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-        seq_k, seq_q, head_dim,
-        &scale,
-        K, CUDA_R_16BF, hidden, head_stride,
-        Q, CUDA_R_16BF, hidden, head_stride,
-        &zero,
-        scores, CUDA_R_32F, seq_k, score_stride,
-        num_heads,
-        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+    for (int query_start = 0; query_start < seq_q &&
+         status == CUBLAS_STATUS_SUCCESS; query_start += tile_q) {
+        int query_count = seq_q - query_start;
+        if (query_count > tile_q) query_count = tile_q;
+        size_t tile_elements =
+            (size_t)num_heads * (size_t)query_count * (size_t)seq_k;
+        const long long score_stride = (long long)query_count * seq_k;
+        const uint16_t *q_tile = Q + (size_t)query_start * hidden;
+        uint16_t *out_tile = out + (size_t)query_start * hidden;
 
-    if (status == CUBLAS_STATUS_SUCCESS) {
-        launch_softmax_f32(scores, num_heads * seq_q, seq_k, g_stream);
-        launch_f32_to_bf16(scores, probs, (int)score_elements, g_stream);
-
+        /* Accumulate and normalize logits in f32.  Only normalized
+         * probabilities are narrowed to bf16 for the Tensor Core V product. */
         status = cublasGemmStridedBatchedEx(
-            g_cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-            head_dim, seq_q, seq_k,
-            &one,
-            V, CUDA_R_16BF, hidden, head_stride,
-            probs, CUDA_R_16BF, seq_k, score_stride,
+            g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            seq_k, query_count, head_dim,
+            &scale,
+            K, CUDA_R_16BF, hidden, head_stride,
+            q_tile, CUDA_R_16BF, hidden, head_stride,
             &zero,
-            out, CUDA_R_16BF, hidden, head_stride,
+            scores, CUDA_R_32F, seq_k, score_stride,
             num_heads,
             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+
+        if (status == CUBLAS_STATUS_SUCCESS) {
+            launch_softmax_f32(scores, num_heads * query_count, seq_k, g_stream);
+            launch_f32_to_bf16(scores, probs, (int)tile_elements, g_stream);
+
+            status = cublasGemmStridedBatchedEx(
+                g_cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                head_dim, query_count, seq_k,
+                &one,
+                V, CUDA_R_16BF, hidden, head_stride,
+                probs, CUDA_R_16BF, seq_k, score_stride,
+                &zero,
+                out_tile, CUDA_R_16BF, hidden, head_stride,
+                num_heads,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        }
     }
 
     int ok = status == CUBLAS_STATUS_SUCCESS &&
@@ -1293,6 +1403,118 @@ iris_gpu_tensor_t iris_gpu_conv2d_f32(iris_gpu_tensor_t x, const float *weight, 
                           kH, kW, stride, padding, g_stream);
     }
     return out;
+}
+
+iris_gpu_tensor_t iris_gpu_vae_attention_f32(
+    iris_gpu_tensor_t x,
+    const float *norm_weight, const float *norm_bias,
+    const float *q_weight, const float *q_bias,
+    const float *k_weight, const float *k_bias,
+    const float *v_weight, const float *v_bias,
+    const float *out_weight, const float *out_bias,
+    int batch, int channels, int H, int W, int num_groups, float eps) {
+    if (!x || batch <= 0 || channels <= 0 || H <= 0 || W <= 0 ||
+        !norm_weight || !norm_bias || !q_weight || !k_weight || !v_weight ||
+        !out_weight) return NULL;
+
+    const int spatial = H * W;
+    const size_t elements = (size_t)batch * channels * spatial;
+    const size_t batch_elements = (size_t)channels * spatial;
+    const float scale = 1.0f / sqrtf((float)channels);
+    iris_gpu_tensor_t norm = NULL;
+    iris_gpu_tensor_t projected_nchw = NULL;
+    iris_gpu_tensor_t q = NULL;
+    iris_gpu_tensor_t k = NULL;
+    iris_gpu_tensor_t v = NULL;
+    iris_gpu_tensor_t attn_nhwc = NULL;
+    iris_gpu_tensor_t attn_nchw = NULL;
+    iris_gpu_tensor_t result = NULL;
+
+    norm = iris_gpu_tensor_alloc(elements);
+    if (!norm) goto cleanup;
+    iris_gpu_group_norm_f32(norm, x, norm_weight, norm_bias,
+                            batch, channels, spatial, num_groups, eps);
+
+    q = iris_gpu_tensor_alloc(elements);
+    if (!q) goto cleanup;
+    projected_nchw = iris_gpu_conv2d_f32(norm, q_weight, q_bias,
+                                         batch, channels, channels,
+                                         H, W, 1, 1, 1, 0);
+    if (!projected_nchw) goto cleanup;
+    launch_nchw_to_nhwc_f32((const float *)projected_nchw->device_ptr,
+                            (float *)q->device_ptr,
+                            batch, channels, spatial, g_stream);
+    iris_gpu_tensor_free(projected_nchw);
+    projected_nchw = NULL;
+
+    k = iris_gpu_tensor_alloc(elements);
+    if (!k) goto cleanup;
+    projected_nchw = iris_gpu_conv2d_f32(norm, k_weight, k_bias,
+                                         batch, channels, channels,
+                                         H, W, 1, 1, 1, 0);
+    if (!projected_nchw) goto cleanup;
+    launch_nchw_to_nhwc_f32((const float *)projected_nchw->device_ptr,
+                            (float *)k->device_ptr,
+                            batch, channels, spatial, g_stream);
+    iris_gpu_tensor_free(projected_nchw);
+    projected_nchw = NULL;
+
+    v = iris_gpu_tensor_alloc(elements);
+    if (!v) goto cleanup;
+    projected_nchw = iris_gpu_conv2d_f32(norm, v_weight, v_bias,
+                                         batch, channels, channels,
+                                         H, W, 1, 1, 1, 0);
+    if (!projected_nchw) goto cleanup;
+    launch_nchw_to_nhwc_f32((const float *)projected_nchw->device_ptr,
+                            (float *)v->device_ptr,
+                            batch, channels, spatial, g_stream);
+    iris_gpu_tensor_free(projected_nchw);
+    projected_nchw = NULL;
+    iris_gpu_tensor_free(norm);
+    norm = NULL;
+
+    attn_nhwc = iris_gpu_tensor_alloc(elements);
+    if (!attn_nhwc) goto cleanup;
+    for (int b = 0; b < batch; b++) {
+        const float *q_b = (const float *)q->device_ptr + b * batch_elements;
+        const float *k_b = (const float *)k->device_ptr + b * batch_elements;
+        const float *v_b = (const float *)v->device_ptr + b * batch_elements;
+        float *out_b = (float *)attn_nhwc->device_ptr + b * batch_elements;
+        if (!attention_cublas_f32(out_b, q_b, k_b, v_b,
+                                  spatial, spatial, 1, channels, scale) &&
+            !launch_attention_fused_f32(q_b, k_b, v_b, out_b,
+                                        spatial, spatial, 1, channels,
+                                        scale, g_stream)) {
+            goto cleanup;
+        }
+    }
+    iris_gpu_tensor_free(q); q = NULL;
+    iris_gpu_tensor_free(k); k = NULL;
+    iris_gpu_tensor_free(v); v = NULL;
+
+    attn_nchw = iris_gpu_tensor_alloc(elements);
+    if (!attn_nchw) goto cleanup;
+    launch_nhwc_to_nchw_f32((const float *)attn_nhwc->device_ptr,
+                            (float *)attn_nchw->device_ptr,
+                            batch, channels, spatial, g_stream);
+    iris_gpu_tensor_free(attn_nhwc);
+    attn_nhwc = NULL;
+
+    result = iris_gpu_conv2d_f32(attn_nchw, out_weight, out_bias,
+                                  batch, channels, channels,
+                                  H, W, 1, 1, 1, 0);
+    if (result)
+        iris_gpu_add_f32(result, x, result, (int)elements);
+
+cleanup:
+    if (norm) iris_gpu_tensor_free(norm);
+    if (projected_nchw) iris_gpu_tensor_free(projected_nchw);
+    if (q) iris_gpu_tensor_free(q);
+    if (k) iris_gpu_tensor_free(k);
+    if (v) iris_gpu_tensor_free(v);
+    if (attn_nhwc) iris_gpu_tensor_free(attn_nhwc);
+    if (attn_nchw) iris_gpu_tensor_free(attn_nchw);
+    return result;
 }
 
 void iris_gpu_copy_f32(iris_gpu_tensor_t dst, iris_gpu_tensor_t src, size_t n) {

@@ -115,7 +115,8 @@ endif
 # =============================================================================
 CUDA_PATH ?= /opt/cuda
 NVCC ?= $(CUDA_PATH)/bin/nvcc
-CUDA_ARCH ?= sm_86
+CUDA_DETECTED_CC := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 | tr -cd '0-9')
+CUDA_ARCH ?= $(if $(CUDA_DETECTED_CC),sm_$(CUDA_DETECTED_CC),sm_86)
 CUDA_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_PATH)/include
 CUDA_NVCCFLAGS = -O3 -arch=$(CUDA_ARCH) --use_fast_math -DUSE_CUDA -I. -I$(CUDA_PATH)/include -Xcompiler -fPIC
 CUDA_LDFLAGS = $(LDFLAGS) -L$(CUDA_PATH)/lib64 -lcublas -lcublasLt -lcudart -lopenblas -lstdc++

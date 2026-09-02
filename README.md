@@ -278,13 +278,15 @@ make            # Show available backends
 make generic    # Pure C, no dependencies (slow)
 make blas       # BLAS acceleration (~30x faster)
 make mps        # Apple Silicon Metal GPU (fastest, macOS only)
-make cuda       # NVIDIA CUDA GPU (Linux; defaults to sm_86)
+make cuda       # NVIDIA CUDA GPU (Linux; auto-detects the installed GPU)
 ```
 
 **Recommended:**
 - macOS Apple Silicon: `make mps`
 - macOS Intel: `make blas`
-- Linux with a supported NVIDIA GPU: `make cuda`
+- Linux with a supported NVIDIA GPU: `make cuda`. The build detects the first
+  GPU's compute capability and falls back to `sm_86` if detection is unavailable;
+  cross-compilers can override it explicitly, for example `make cuda CUDA_ARCH=sm_89`.
 - Linux with OpenBLAS: `make blas`
 - Linux without OpenBLAS: `make generic`
 

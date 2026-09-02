@@ -1225,6 +1225,32 @@ __global__ void swish_f32_kernel(const float *x, float *out, int n) {
     }
 }
 
+/* VAE convolutions use NCHW while the attention GEMMs consume token-major
+ * [batch, spatial, channels] tensors.  Keep the conversion on-device. */
+__global__ void nchw_to_nhwc_f32_kernel(
+    const float *__restrict__ in, float *__restrict__ out,
+    int channels, int spatial, int total
+) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= total) return;
+    int s = idx % spatial;
+    int c = (idx / spatial) % channels;
+    int b = idx / (channels * spatial);
+    out[((size_t)b * spatial + s) * channels + c] = in[idx];
+}
+
+__global__ void nhwc_to_nchw_f32_kernel(
+    const float *__restrict__ in, float *__restrict__ out,
+    int channels, int spatial, int total
+) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= total) return;
+    int c = idx % channels;
+    int s = (idx / channels) % spatial;
+    int b = idx / (channels * spatial);
+    out[((size_t)b * channels + c) * spatial + s] = in[idx];
+}
+
 __global__ void upsample_nearest_2x_f32_kernel(
     const float *__restrict__ x,
     float *__restrict__ out,
@@ -1593,6 +1619,20 @@ void launch_swish_f32(const float *x, float *out, int n, cudaStream_t stream) {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     swish_f32_kernel<<<blocks, threads, 0, stream>>>(x, out, n);
+}
+
+void launch_nchw_to_nhwc_f32(const float *in, float *out, int batch, int channels, int spatial, cudaStream_t stream) {
+    int total = batch * channels * spatial;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    nchw_to_nhwc_f32_kernel<<<blocks, threads, 0, stream>>>(in, out, channels, spatial, total);
+}
+
+void launch_nhwc_to_nchw_f32(const float *in, float *out, int batch, int channels, int spatial, cudaStream_t stream) {
+    int total = batch * channels * spatial;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    nhwc_to_nchw_f32_kernel<<<blocks, threads, 0, stream>>>(in, out, channels, spatial, total);
 }
 
 void launch_upsample_nearest_2x_f32(const float *x, float *out, int channels, int in_h, int in_w, cudaStream_t stream) {

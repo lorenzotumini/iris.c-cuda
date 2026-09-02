@@ -529,7 +529,8 @@ static iris_gpu_tensor_t resblock_forward_gpu(iris_gpu_tensor_t x,
 }
 
 /* GPU-resident VAE decode.
- * Keeps all data on GPU, only syncs for mid-block attention (CPU) and final output.
+ * The CUDA path keeps all data on GPU through the decoder; Metal retains its
+ * existing CPU mid-block attention path. Both sync for the final output.
  * Returns NULL on failure (caller falls back to CPU path). */
 static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
                                    int batch, int latent_h, int latent_w) {
@@ -605,17 +606,29 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
     x = t;
     if (iris_vae_progress_callback) iris_vae_progress_callback(progress++, total_blocks);
 
-    /* Mid block attention: sync to CPU, run attention, upload back */
+    /* Mid block attention. CUDA keeps normalization, projections, attention,
+     * and the residual on GPU. */
+#ifdef USE_CUDA
+    t = iris_gpu_vae_attention_f32(
+        x,
+        vae->dec_mid_attn.norm_weight, vae->dec_mid_attn.norm_bias,
+        vae->dec_mid_attn.q_weight, vae->dec_mid_attn.q_bias,
+        vae->dec_mid_attn.k_weight, vae->dec_mid_attn.k_bias,
+        vae->dec_mid_attn.v_weight, vae->dec_mid_attn.v_bias,
+        vae->dec_mid_attn.out_weight, vae->dec_mid_attn.out_bias,
+        batch, mid_ch, cur_h, cur_w, vae->num_groups, vae->eps);
+    iris_gpu_tensor_free(x);
+    if (!t) { iris_gpu_batch_end(); return NULL; }
+    x = t;
+    if (iris_vae_progress_callback) iris_vae_progress_callback(progress++, total_blocks);
+#else
     {
         size_t attn_size = (size_t)batch * mid_ch * cur_h * cur_w;
         float *cpu_attn_in = cpu_work;
 
-        iris_gpu_batch_end();  /* Sync: execute everything queued so far */
-
-        /* Download GPU tensor to CPU */
+        iris_gpu_batch_end();
         iris_gpu_tensor_read(x, cpu_attn_in);
 
-        /* Run attention on CPU (uses existing attnblock_forward) */
         float *cpu_attn_out = cpu_x;
         if (attnblock_forward(cpu_attn_out, cpu_attn_in, &vae->dec_mid_attn,
                                vae->work3, batch, cur_h, cur_w,
@@ -623,15 +636,15 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
             iris_gpu_tensor_free(x);
             return NULL;
         }
-        if (iris_vae_progress_callback) iris_vae_progress_callback(progress++, total_blocks);
+        if (iris_vae_progress_callback)
+            iris_vae_progress_callback(progress++, total_blocks);
 
-        /* Upload result back to GPU */
         iris_gpu_tensor_free(x);
         x = iris_gpu_tensor_create(cpu_attn_out, attn_size);
         if (!x) return NULL;
-
-        iris_gpu_batch_begin();  /* Start new batch for remaining work */
+        iris_gpu_batch_begin();
     }
+#endif
 
     /* Mid block: resblock2 */
     t = resblock_forward_gpu(x, &vae->dec_mid_block2, batch, cur_h, cur_w, vae->num_groups, vae->eps);

@@ -623,23 +623,23 @@ static int load_double_block_weights(double_block_t *b, safetensors_file_t **fil
  * Note: bf16 pointers are direct mmap pointers, don't free them */
 static void free_double_block_weights(double_block_t *b) {
 #ifdef USE_CUDA
-    /* Queue per-weight eviction after this block's work.  Flushing the entire
-     * CUDA cache here serialized every block and also discarded RoPE/input
-     * weights that are safe to retain. */
-    iris_cuda_invalidate_weight(b->img_q_weight_bf16);
-    iris_cuda_invalidate_weight(b->img_k_weight_bf16);
-    iris_cuda_invalidate_weight(b->img_v_weight_bf16);
-    iris_cuda_invalidate_weight(b->img_proj_weight_bf16);
-    iris_cuda_invalidate_weight(b->img_mlp_gate_weight_bf16);
-    iris_cuda_invalidate_weight(b->img_mlp_up_weight_bf16);
-    iris_cuda_invalidate_weight(b->img_mlp_down_weight_bf16);
-    iris_cuda_invalidate_weight(b->txt_q_weight_bf16);
-    iris_cuda_invalidate_weight(b->txt_k_weight_bf16);
-    iris_cuda_invalidate_weight(b->txt_v_weight_bf16);
-    iris_cuda_invalidate_weight(b->txt_proj_weight_bf16);
-    iris_cuda_invalidate_weight(b->txt_mlp_gate_weight_bf16);
-    iris_cuda_invalidate_weight(b->txt_mlp_up_weight_bf16);
-    iris_cuda_invalidate_weight(b->txt_mlp_down_weight_bf16);
+    /* Keep a bounded subset of stable mmap-backed BF16 weights across steps;
+     * evict the rest after this block's work. F32 allocations are temporary
+     * host buffers and must always be invalidated before they are freed. */
+    iris_cuda_release_streaming_weight(b->img_q_weight_bf16);
+    iris_cuda_release_streaming_weight(b->img_k_weight_bf16);
+    iris_cuda_release_streaming_weight(b->img_v_weight_bf16);
+    iris_cuda_release_streaming_weight(b->img_proj_weight_bf16);
+    iris_cuda_release_streaming_weight(b->img_mlp_gate_weight_bf16);
+    iris_cuda_release_streaming_weight(b->img_mlp_up_weight_bf16);
+    iris_cuda_release_streaming_weight(b->img_mlp_down_weight_bf16);
+    iris_cuda_release_streaming_weight(b->txt_q_weight_bf16);
+    iris_cuda_release_streaming_weight(b->txt_k_weight_bf16);
+    iris_cuda_release_streaming_weight(b->txt_v_weight_bf16);
+    iris_cuda_release_streaming_weight(b->txt_proj_weight_bf16);
+    iris_cuda_release_streaming_weight(b->txt_mlp_gate_weight_bf16);
+    iris_cuda_release_streaming_weight(b->txt_mlp_up_weight_bf16);
+    iris_cuda_release_streaming_weight(b->txt_mlp_down_weight_bf16);
     iris_cuda_invalidate_weight(b->img_q_weight);
     iris_cuda_invalidate_weight(b->img_k_weight);
     iris_cuda_invalidate_weight(b->img_v_weight);
@@ -727,8 +727,8 @@ static int load_single_block_weights(single_block_t *b, safetensors_file_t **fil
  * Note: bf16 pointers are direct mmap pointers, don't free them */
 static void free_single_block_weights(single_block_t *b) {
 #ifdef USE_CUDA
-    iris_cuda_invalidate_weight(b->qkv_mlp_weight_bf16);
-    iris_cuda_invalidate_weight(b->proj_mlp_weight_bf16);
+    iris_cuda_release_streaming_weight(b->qkv_mlp_weight_bf16);
+    iris_cuda_release_streaming_weight(b->proj_mlp_weight_bf16);
     iris_cuda_invalidate_weight(b->qkv_mlp_weight);
     iris_cuda_invalidate_weight(b->proj_mlp_weight);
 #elif defined(USE_METAL)
@@ -751,6 +751,9 @@ void iris_transformer_free_mmap_cache_flux(iris_transformer_flux_t *tf) {
         free_double_block_weights(&tf->double_blocks[i]);
     for (int i = 0; i < tf->num_single_layers; i++)
         free_single_block_weights(&tf->single_blocks[i]);
+#ifdef USE_CUDA
+    iris_cuda_clear_streaming_weights();
+#endif
 }
 
 #ifdef USE_METAL
