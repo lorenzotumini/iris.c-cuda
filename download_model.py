@@ -3,7 +3,8 @@
 Download supported Iris model files from HuggingFace.
 
 Usage:
-    python download_model.py MODEL [--token TOKEN] [--output-dir DIR]
+    python download_model.py MODEL [--variant bf16] [--token TOKEN]
+                             [--output-dir DIR]
 
 Requirements:
     pip install huggingface_hub
@@ -23,10 +24,15 @@ MODELS = {
     "zimage-turbo": ("Tongyi-MAI/Z-Image-Turbo", "./zimage-turbo"),
 }
 
+# The native BF16 Z-Image transformer is currently published as an upstream
+# Hugging Face pull-request revision rather than on the repository's main
+# branch. Pinning the revision makes the download reproducible.
+ZIMAGE_BF16_REVISION = "refs/pr/102"
+
 USAGE_TEXT = """\
 Iris Model Downloader
 
-Usage: python download_model.py MODEL [--token TOKEN] [--output-dir DIR]
+Usage: python download_model.py MODEL [--variant bf16] [--token TOKEN] [--output-dir DIR]
 
 Available models:
 
@@ -34,7 +40,11 @@ Available models:
   4b-base       Base 4B (50 steps, CFG, higher quality, ~16 GB disk)
   9b            Distilled 9B (4 steps, higher quality, non-commercial, ~30 GB disk)
   9b-base       Base 9B (50 steps, CFG, highest quality, non-commercial, ~30 GB disk)
-  zimage-turbo  Z-Image-Turbo 6B (8 NFE / 9 scheduler steps, Apache 2.0, ~31 GB disk)
+  zimage-turbo  Z-Image-Turbo 6B (8 NFE / 9 scheduler steps, Apache 2.0)
+
+Z-Image variants:
+  fp32           Official main snapshot (~31 GB total, default)
+  bf16           Native BF16 transformer (~20 GB total, CUDA recommended)
 
 By default this implementation uses mmap() so inference is often
 possible with less RAM than the model size.
@@ -66,7 +76,16 @@ def main():
         default=None,
         help='HuggingFace authentication token (for gated models like 9B)'
     )
+    parser.add_argument(
+        '--variant',
+        choices=('fp32', 'bf16'),
+        default=None,
+        help='Z-Image weight variant (default: fp32)'
+    )
     args = parser.parse_args()
+
+    if args.variant is not None and args.model != 'zimage-turbo':
+        parser.error('--variant is currently supported only for zimage-turbo')
 
     try:
         from huggingface_hub import snapshot_download
@@ -82,27 +101,50 @@ def main():
         token = os.environ.get('HF_TOKEN')
 
     repo_id, default_dir = MODELS[args.model]
+    variant = args.variant or 'fp32'
+    revision = None
+    if args.model == 'zimage-turbo' and variant == 'bf16':
+        revision = ZIMAGE_BF16_REVISION
+        default_dir = './zimage-turbo-bf16'
     output_dir = Path(args.output_dir if args.output_dir else default_dir)
 
     print("Iris Model Downloader")
     print("================================")
     print()
     print(f"Repository: {repo_id}")
+    if args.model == 'zimage-turbo':
+        print(f"Variant: {variant.upper()}")
+    if revision:
+        print(f"Revision: {revision}")
     print(f"Output dir: {output_dir}")
     if token:
         print(f"Auth: using token")
     print()
 
-    # Files to download - VAE, transformer, Qwen3 text encoder, and model_index.json
+    # Keep patterns precise: the BF16 PR revision contains both transformer
+    # variants, and downloading transformer/*.safetensors would fetch both.
     patterns = [
         "model_index.json",
-        "vae/*.safetensors",
         "vae/*.json",
-        "transformer/*.safetensors",
-        "transformer/*.json",
-        "text_encoder/*",
+        "vae/diffusion_pytorch_model.safetensors",
+        "transformer/config.json",
+        "text_encoder/*.json",
+        "text_encoder/model.safetensors",
+        "text_encoder/model-*.safetensors",
         "tokenizer/*",
     ]
+    if args.model == 'zimage-turbo' and variant == 'bf16':
+        patterns.extend([
+            "transformer/diffusion_pytorch_model.safetensors.index.bf16.json",
+            "transformer/diffusion_pytorch_model.bf16-*.safetensors",
+            "transformer/diffusion_pytorch_model.bf16.safetensors",
+        ])
+    else:
+        patterns.extend([
+            "transformer/diffusion_pytorch_model.safetensors.index.json",
+            "transformer/diffusion_pytorch_model-*.safetensors",
+            "transformer/diffusion_pytorch_model.safetensors",
+        ])
 
     print("Downloading files...")
     print("(This may take a while depending on your connection)")
@@ -115,6 +157,7 @@ def main():
             allow_patterns=patterns,
             ignore_patterns=["*.bin", "*.pt", "*.pth"],  # Skip pytorch format
             token=token,
+            revision=revision,
         )
         print()
         print("Download complete!")
@@ -132,6 +175,11 @@ def main():
             total_size += vae_size
             print(f"  VAE:          {vae_size / 1024 / 1024:.1f} MB")
         tf_files = list(tf_dir.glob("*.safetensors")) if tf_dir.exists() else []
+        if args.model == 'zimage-turbo':
+            if variant == 'bf16':
+                tf_files = [f for f in tf_files if '.bf16' in f.name]
+            else:
+                tf_files = [f for f in tf_files if '.bf16' not in f.name]
         if tf_files:
             tf_size = sum(f.stat().st_size for f in tf_files)
             total_size += tf_size

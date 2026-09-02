@@ -2294,6 +2294,109 @@ static void zi_free_block(zi_block_t *block, int free_f32_weights,
 #endif
 }
 
+/* Open every shard named by a Diffusers safetensors index.  Return 0 when
+ * the index does not exist, 1 on success, and -1 for an invalid or incomplete
+ * index.  An existing BF16 index must not silently fall back to FP32 if its
+ * download was interrupted. */
+static int zi_open_index_shards(const char *model_dir, const char *index_name,
+                                safetensors_file_t **files, int *n_files) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/transformer/%s", model_dir, index_name);
+    FILE *idx_f = fopen(path, "r");
+    if (!idx_f) return 0;
+
+    if (fseek(idx_f, 0, SEEK_END) != 0) {
+        fclose(idx_f);
+        return -1;
+    }
+    long fsize = ftell(idx_f);
+    if (fsize <= 0 || fseek(idx_f, 0, SEEK_SET) != 0) {
+        fclose(idx_f);
+        return -1;
+    }
+
+    char *json = (char *)malloc((size_t)fsize + 1);
+    if (!json) {
+        fclose(idx_f);
+        return -1;
+    }
+    size_t nread = fread(json, 1, (size_t)fsize, idx_f);
+    fclose(idx_f);
+    if (nread != (size_t)fsize) {
+        free(json);
+        return -1;
+    }
+    json[fsize] = 0;
+
+    char seen[ZI_MAX_SHARDS][256];
+    int n_seen = 0;
+    char *p = json;
+    while ((p = strstr(p, ".safetensors")) != NULL) {
+        char *end = p + strlen(".safetensors");
+        char *start = p;
+        while (start > json && *(start - 1) != '"') start--;
+
+        size_t len = (size_t)(end - start);
+        if (len > 0 && len < sizeof(seen[0])) {
+            char fname[sizeof(seen[0])];
+            memcpy(fname, start, len);
+            fname[len] = 0;
+
+            int found = 0;
+            for (int i = 0; i < n_seen; i++) {
+                if (strcmp(seen[i], fname) == 0) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found && n_seen < ZI_MAX_SHARDS) {
+                strcpy(seen[n_seen++], fname);
+            }
+        }
+        p = end;
+    }
+    free(json);
+
+    if (n_seen == 0) {
+        fprintf(stderr, "Z-Image: no safetensors shards in %s\n", path);
+        return -1;
+    }
+
+    *n_files = 0;
+    for (int i = 0; i < n_seen; i++) {
+        snprintf(path, sizeof(path), "%s/transformer/%.*s", model_dir,
+                 (int)sizeof(seen[i]) - 1, seen[i]);
+        files[*n_files] = safetensors_open(path);
+        if (!files[*n_files]) {
+            fprintf(stderr, "Z-Image: incomplete checkpoint; missing %s\n", path);
+            for (int f = 0; f < *n_files; f++) {
+                safetensors_close(files[f]);
+                files[f] = NULL;
+            }
+            *n_files = 0;
+            return -1;
+        }
+        (*n_files)++;
+    }
+    return 1;
+}
+
+static int zi_open_single_checkpoint(const char *model_dir,
+                                     const char *filename,
+                                     safetensors_file_t **files,
+                                     int *n_files) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/transformer/%s", model_dir, filename);
+    FILE *probe = fopen(path, "rb");
+    if (!probe) return 0;
+    fclose(probe);
+
+    files[0] = safetensors_open(path);
+    if (!files[0]) return -1;
+    *n_files = 1;
+    return 1;
+}
+
 /* Loads Z-Image transformer weights from sharded safetensors files.
  * Auto-discovers shards from index JSON, probes weights to determine FFN dim
  * and timestep MLP size. In CPU mode: uses mmap zero-copy pointers for f32
@@ -2329,71 +2432,47 @@ zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
         tf->axes_lens[i] = 1024;  /* Default max positions */
     }
 
-    /* Open safetensors files */
-    char path[1024];
-
-    /* Try index file first for sharded models */
-    snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors.index.json", model_dir);
-    FILE *idx_f = fopen(path, "r");
-
+    /* CUDA prefers the native BF16 Diffusers variant when both variants are
+     * installed. Other backends retain their existing preference for FP32,
+     * but can still open a BF16-only directory and convert it as before. */
     safetensors_file_t *files[ZI_MAX_SHARDS] = {0};
     int n_files = 0;
+    const char *selected_weights = NULL;
+    const char *index_candidates[3];
+    int n_index_candidates = 0;
+#ifdef USE_CUDA
+    index_candidates[n_index_candidates++] = "diffusion_pytorch_model.safetensors.index.bf16.json";
+    index_candidates[n_index_candidates++] = "diffusion_pytorch_model.bf16.safetensors.index.json";
+#endif
+    index_candidates[n_index_candidates++] = "diffusion_pytorch_model.safetensors.index.json";
+#ifndef USE_CUDA
+    index_candidates[n_index_candidates++] = "diffusion_pytorch_model.safetensors.index.bf16.json";
+    index_candidates[n_index_candidates++] = "diffusion_pytorch_model.bf16.safetensors.index.json";
+#endif
 
-    if (idx_f) {
-        /* Sharded: parse index to find shard files */
-        fseek(idx_f, 0, SEEK_END);
-        long fsize = ftell(idx_f);
-        fseek(idx_f, 0, SEEK_SET);
-        char *json = (char *)malloc(fsize + 1);
-        if (!json) {
-            fclose(idx_f);
-            goto error;
+    for (int i = 0; i < n_index_candidates && n_files == 0; i++) {
+        int rc = zi_open_index_shards(model_dir, index_candidates[i],
+                                      files, &n_files);
+        if (rc < 0) goto error;
+        if (rc > 0) selected_weights = index_candidates[i];
+    }
+
+    if (n_files == 0) {
+        const char *single_candidates[2];
+        int n_single_candidates = 0;
+#ifdef USE_CUDA
+        single_candidates[n_single_candidates++] = "diffusion_pytorch_model.bf16.safetensors";
+#endif
+        single_candidates[n_single_candidates++] = "diffusion_pytorch_model.safetensors";
+#ifndef USE_CUDA
+        single_candidates[n_single_candidates++] = "diffusion_pytorch_model.bf16.safetensors";
+#endif
+        for (int i = 0; i < n_single_candidates && n_files == 0; i++) {
+            int rc = zi_open_single_checkpoint(model_dir, single_candidates[i],
+                                               files, &n_files);
+            if (rc < 0) goto error;
+            if (rc > 0) selected_weights = single_candidates[i];
         }
-        fread(json, 1, fsize, idx_f);
-        json[fsize] = 0;
-        fclose(idx_f);
-
-        /* Find unique shard filenames */
-        char seen[32][128];
-        int n_seen = 0;
-        char *p = json;
-        while ((p = strstr(p, ".safetensors")) != NULL) {
-            /* Find start of filename */
-            char *end = p + strlen(".safetensors");
-            char *start = p;
-            while (start > json && *(start - 1) != '"') start--;
-
-            int len = (int)(end - start);
-            if (len < 128) {
-                char fname[128];
-                memcpy(fname, start, len);
-                fname[len] = 0;
-
-                /* Check if already seen */
-                int found = 0;
-                for (int i = 0; i < n_seen; i++) {
-                    if (strcmp(seen[i], fname) == 0) { found = 1; break; }
-                }
-                if (!found && n_seen < ZI_MAX_SHARDS) {
-                    strcpy(seen[n_seen], fname);
-                    n_seen++;
-                }
-            }
-            p = end;
-        }
-        free(json);
-
-        /* Open each shard */
-        for (int i = 0; i < n_seen && n_files < ZI_MAX_SHARDS; i++) {
-            snprintf(path, sizeof(path), "%s/transformer/%s", model_dir, seen[i]);
-            files[n_files] = safetensors_open(path);
-            if (files[n_files]) n_files++;
-        }
-    } else {
-        /* Single file */
-        snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors", model_dir);
-        files[0] = safetensors_open(path);
-        if (files[0]) n_files = 1;
     }
 
     if (n_files == 0) {
@@ -2405,7 +2484,8 @@ zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
     for (int i = 0; i < n_files; i++) tf->sf_files[i] = files[i];
 
     if (iris_verbose)
-        fprintf(stderr, "  Loading Z-Image transformer (%d shards)...\n", n_files);
+        fprintf(stderr, "  Loading Z-Image transformer (%d shard%s, %s)...\n",
+                n_files, n_files == 1 ? "" : "s", selected_weights);
 
     /* Determine FFN dimension from weights */
     const safetensor_t *w1_probe = NULL;

@@ -641,20 +641,40 @@ void iris_cuda_sgemm_bf16(int transpose_a, int transpose_b, int M, int N, int K,
     int a_on_dev = (cudaPointerGetAttributes(&attr_A, A) == cudaSuccess && attr_A.type == cudaMemoryTypeDevice);
     int c_on_dev = (cudaPointerGetAttributes(&attr_C, C) == cudaSuccess && attr_C.type == cudaMemoryTypeDevice);
 
-    void *d_A = (void *)A;
+    void *d_A_f32 = (void *)A;
     void *d_C = (void *)C;
-    void *tmp_A = NULL, *tmp_C = NULL;
+    void *tmp_A_f32 = NULL, *tmp_A_bf16 = NULL, *tmp_C = NULL;
+    int tmp_A_f32_async = 0, tmp_A_bf16_async = 0, tmp_C_async = 0;
 
-    size_t sz_A = (size_t)M * lda * sizeof(float);
+    size_t elems_A = (size_t)(transpose_a ? K : M) * lda;
+    size_t sz_A = elems_A * sizeof(float);
     size_t sz_C = (size_t)M * ldc * sizeof(float);
 
     if (!a_on_dev) {
-        cudaMalloc(&tmp_A, sz_A);
-        cudaMemcpyAsync(tmp_A, A, sz_A, cudaMemcpyHostToDevice, g_stream);
-        d_A = tmp_A;
+        if (device_alloc(&tmp_A_f32, sz_A, &tmp_A_f32_async) != cudaSuccess) return;
+        if (cudaMemcpyAsync(tmp_A_f32, A, sz_A, cudaMemcpyHostToDevice, g_stream) != cudaSuccess) {
+            device_free(tmp_A_f32, tmp_A_f32_async);
+            return;
+        }
+        d_A_f32 = tmp_A_f32;
     }
+
+    /* cuBLAS BF16 Tensor Core GEMMs require both matrix operands to be
+     * BF16. Convert the activation operand on the CUDA stream instead of
+     * asking GemmEx for the unsupported F32 x BF16 combination. */
+    if (device_alloc(&tmp_A_bf16, elems_A * sizeof(uint16_t),
+                     &tmp_A_bf16_async) != cudaSuccess) {
+        device_free(tmp_A_f32, tmp_A_f32_async);
+        return;
+    }
+    launch_f32_to_bf16((const float *)d_A_f32, (uint16_t *)tmp_A_bf16,
+                       (int)elems_A, g_stream);
     if (!c_on_dev) {
-        cudaMalloc(&tmp_C, sz_C);
+        if (device_alloc(&tmp_C, sz_C, &tmp_C_async) != cudaSuccess) {
+            device_free(tmp_A_bf16, tmp_A_bf16_async);
+            device_free(tmp_A_f32, tmp_A_f32_async);
+            return;
+        }
         if (beta != 0.0f) {
             cudaMemcpyAsync(tmp_C, C, sz_C, cudaMemcpyHostToDevice, g_stream);
         }
@@ -664,25 +684,25 @@ void iris_cuda_sgemm_bf16(int transpose_a, int transpose_b, int M, int N, int K,
     cublasOperation_t op_A = transpose_a ? CUBLAS_OP_T : CUBLAS_OP_N;
     cublasOperation_t op_B = transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
 
-    /* Mixed precision SGEMM with BF16 weights */
-    cublasGemmEx(g_cublas,
-                 op_B, op_A,
-                 N, M, K,
-                 &alpha,
-                 d_B, CUDA_R_16BF, ldb,
-                 d_A, CUDA_R_32F, lda,
-                 &beta,
-                 d_C, CUDA_R_32F, ldc,
-                 CUBLAS_COMPUTE_32F_FAST_TF32,
-                 CUBLAS_GEMM_DEFAULT);
+    cublasStatus_t status = cublasGemmEx(g_cublas,
+                                         op_B, op_A,
+                                         N, M, K,
+                                         &alpha,
+                                         d_B, CUDA_R_16BF, ldb,
+                                         tmp_A_bf16, CUDA_R_16BF, lda,
+                                         &beta,
+                                         d_C, CUDA_R_32F, ldc,
+                                         CUBLAS_COMPUTE_32F,
+                                         CUBLAS_GEMM_DEFAULT);
 
-    if (!c_on_dev) {
+    if (status == CUBLAS_STATUS_SUCCESS && !c_on_dev) {
         cudaMemcpyAsync(C, tmp_C, sz_C, cudaMemcpyDeviceToHost, g_stream);
         cudaStreamSynchronize(g_stream);
     }
 
-    if (tmp_A) cudaFree(tmp_A);
-    if (tmp_C) cudaFree(tmp_C);
+    device_free(tmp_A_bf16, tmp_A_bf16_async);
+    device_free(tmp_A_f32, tmp_A_f32_async);
+    device_free(tmp_C, tmp_C_async);
 }
 
 void iris_metal_sgemm_bf16(int transpose_a, int transpose_b, int M, int N, int K, float alpha, const float *A, int lda, const uint16_t *B_bf16, int ldb, float beta, float *C, int ldc) {
@@ -725,6 +745,8 @@ iris_gpu_tensor_t iris_gpu_linear_bf16_native(iris_gpu_tensor_t x, const uint16_
 
 int iris_gpu_linear_bf16_into(iris_gpu_tensor_t out, iris_gpu_tensor_t x, const uint16_t *W_bf16, int seq_len, int in_dim, int out_dim) {
     if (!iris_cuda_available() || !out || !x || !W_bf16) return 0;
+    if (x->num_elements < (size_t)seq_len * in_dim ||
+        out->num_elements < (size_t)seq_len * out_dim) return 0;
 
     void *d_W = get_or_create_cached_weight(W_bf16, (size_t)out_dim * in_dim * sizeof(uint16_t));
     if (!d_W) return 0;
@@ -732,7 +754,18 @@ int iris_gpu_linear_bf16_into(iris_gpu_tensor_t out, iris_gpu_tensor_t x, const 
     float alpha = 1.0f;
     float beta = 0.0f;
 
-    cudaDataType_t x_type = x->is_f16 ? CUDA_R_16BF : CUDA_R_32F;
+    transient_buffer_t x_bf16 = {NULL, 0};
+    const void *d_x = x->device_ptr;
+    if (!x->is_f16) {
+        size_t x_elements = (size_t)seq_len * in_dim;
+        if (device_alloc(&x_bf16.ptr, x_elements * sizeof(uint16_t),
+                         &x_bf16.async_alloc) != cudaSuccess) {
+            return 0;
+        }
+        launch_f32_to_bf16((const float *)x->device_ptr,
+                           (uint16_t *)x_bf16.ptr, (int)x_elements, g_stream);
+        d_x = x_bf16.ptr;
+    }
     cudaDataType_t out_type = out->is_f16 ? CUDA_R_16BF : CUDA_R_32F;
 
     cublasStatus_t status = cublasGemmEx(
@@ -741,12 +774,13 @@ int iris_gpu_linear_bf16_into(iris_gpu_tensor_t out, iris_gpu_tensor_t x, const 
         out_dim, seq_len, in_dim,
         &alpha,
         d_W, CUDA_R_16BF, in_dim,
-        x->device_ptr, x_type, in_dim,
+        d_x, CUDA_R_16BF, in_dim,
         &beta,
         out->device_ptr, out_type, out_dim,
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT);
 
+    release_transient(&x_bf16);
     return (status == CUBLAS_STATUS_SUCCESS);
 }
 
