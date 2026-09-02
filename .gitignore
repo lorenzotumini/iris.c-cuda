@@ -24,6 +24,8 @@ documents/
 *.swo
 *~
 .DS_Store
+.venv/
+.envrc
 
 # Build artifacts
 *.a
