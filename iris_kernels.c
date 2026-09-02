@@ -14,6 +14,8 @@
 /* Use Metal for GPU acceleration on Apple Silicon */
 #ifdef USE_METAL
 #include "iris_metal.h"
+#elif defined(USE_CUDA)
+#include "iris_cuda.h"
 #endif
 
 /* Use BLAS for matrix operations when enabled via Makefile */
@@ -144,7 +146,7 @@ void iris_matmul(float *C, const float *A, const float *B,
                  int M, int K, int N) {
     /* C[M,N] = A[M,K] @ B[K,N] */
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     size_t matrix_elements = (size_t)M * N;
     if (iris_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
         iris_metal_sgemm(0, 0,  /* no transpose */
@@ -181,7 +183,7 @@ void iris_matmul_t(float *C, const float *A, const float *B,
                    int M, int K, int N) {
     /* C[M,N] = A[M,K] @ B[N,K]^T */
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     size_t matrix_elements = (size_t)M * N;
     if (iris_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
         iris_metal_sgemm(0, 1,  /* no transpose A, transpose B */
@@ -218,7 +220,7 @@ void iris_linear(float *y, const float *x, const float *W, const float *b,
                  int seq_len, int in_dim, int out_dim) {
     /* y[seq, out] = x[seq, in] @ W[out, in]^T + b[out] */
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Use Metal GPU for large matrices */
     size_t matrix_elements = (size_t)seq_len * out_dim;
     if (iris_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
@@ -292,7 +294,7 @@ void iris_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                              int seq_len, int in_dim, int out_dim) {
     /* y[seq, out] = x[seq, in] @ W[out, in]^T */
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Use Metal GPU for bf16 matmul - provides 2x memory bandwidth */
     size_t matrix_elements = (size_t)seq_len * out_dim;
     if (iris_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
@@ -331,13 +333,13 @@ void iris_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
  * ======================================================================== */
 
 void iris_gpu_begin_batch(void) {
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     iris_metal_begin_batch();
 #endif
 }
 
 void iris_gpu_end_batch(void) {
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     iris_metal_end_batch();
 #endif
 }
@@ -478,7 +480,7 @@ naive_fallback:
 
 void iris_rms_norm(float *out, const float *x, const float *weight,
                    int seq_len, int hidden, float eps) {
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Use GPU for RMSNorm only for very large tensors
      * The CPU-GPU sync overhead usually outweighs benefits for smaller ops */
     size_t elements = (size_t)seq_len * hidden;
@@ -578,7 +580,7 @@ void iris_batch_norm(float *out, const float *x,
  * ======================================================================== */
 
 void iris_silu(float *x, int n) {
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Use GPU for very large arrays (overhead not worth it for small ones) */
     if (iris_metal_shaders_available() && n >= 4 * 1024 * 1024) {
         iris_metal_silu(x, n);
@@ -594,7 +596,7 @@ void iris_silu(float *x, int n) {
 
 /* Fused SiLU(gate) * up in a single pass - avoids double memory traversal */
 void iris_silu_mul(float *gate, const float *up, int n) {
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     if (iris_metal_shaders_available() && n >= 4 * 1024 * 1024) {
         iris_metal_silu_mul(gate, up, n);
         return;
@@ -634,7 +636,7 @@ void iris_softmax_cpu(float *x, int rows, int cols) {
 }
 
 void iris_softmax(float *x, int rows, int cols) {
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Use GPU only for very large softmax operations
      * Sync overhead usually dominates for smaller ops */
     if (iris_metal_shaders_available() && (size_t)rows * cols >= 4 * 1024 * 1024) {

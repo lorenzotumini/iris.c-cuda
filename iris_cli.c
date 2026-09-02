@@ -24,6 +24,8 @@
 #include "terminals.h"
 #ifdef USE_METAL
 #include "iris_metal.h"
+#elif defined(USE_CUDA)
+#include "iris_cuda.h"
 #endif
 
 /* ======================================================================
@@ -338,7 +340,7 @@ static void cli_progress_end(void) {
  * Keep this hook to close any stray tensor batch/chain scopes between runs
  * without flushing model/weight caches (which would add startup lag). */
 static void cli_prepare_next_generation(void) {
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     if (!state.ctx || !iris_is_zimage(state.ctx)) return;
     iris_gpu_batch_end();
     iris_gpu_chain_end();

@@ -1,6 +1,8 @@
 # Iris - a C inference pipeline for image synthesis models
 
-Iris is an inference pipeline that generates images from text prompts using open weights diffusion transformer models. It is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS and BLAS acceleration are optional but recommended. Under macOS, a BLAS API is part of the system, so nothing is required.
+> **CUDA fork:** This fork adds an NVIDIA CUDA backend, optimized and tested on an RTX 3070 Ti (Ampere, `sm_86`). The original Iris project is by [antirez](https://github.com/antirez/iris.c).
+
+Iris is an inference pipeline that generates images from text prompts using open weights diffusion transformer models. It is implemented entirely in C. MPS, CUDA, and BLAS acceleration are optional but recommended. Under macOS, a BLAS API is part of the system, so nothing is required.
 
 The name comes from the Greek goddess Iris, messenger of the gods and personification of the rainbow.
 
@@ -19,6 +21,7 @@ Supported model families:
 ```bash
 # Build (choose your backend)
 make mps       # Apple Silicon (fastest)
+# or: make cuda    # NVIDIA GPU (Linux, CUDA toolkit required)
 # or: make blas    # Intel Mac / Linux with OpenBLAS
 # or: make generic # Pure C, no dependencies
 
@@ -55,7 +58,7 @@ pip install huggingface_hub && python download_model.py zimage-turbo
 ./iris -d zimage-turbo -p "a fish" -o fish.png
 ```
 
-That's it. No Python runtime or CUDA toolkit required at inference time.
+That's it. No Python runtime is required at inference time. The CUDA build requires the NVIDIA CUDA toolkit when compiling and its runtime libraries when running.
 
 ## Example Output
 
@@ -73,6 +76,7 @@ That's it. No Python runtime or CUDA toolkit required at inference time.
 
 - **Zero dependencies**: Pure C implementation, works standalone. BLAS optional for ~30x speedup (Apple Accelerate on macOS, OpenBLAS on Linux)
 - **Metal GPU acceleration**: Automatic on Apple Silicon Macs. Performance matches PyTorch's optimized MPS pipeline
+- **CUDA GPU acceleration**: Tensor Core attention and cuBLAS kernels for NVIDIA GPUs; optimized for 8 GB Ampere cards such as the RTX 3070 Ti
 - **Runs where Python can't**: Memory-mapped weights (default) enable inference on 8GB RAM systems where the Python ML stack cannot run at all
 - **Text-to-image**: Generate images from text prompts
 - **Image-to-image**: Transform existing images guided by prompts (Flux models)
@@ -274,11 +278,13 @@ make            # Show available backends
 make generic    # Pure C, no dependencies (slow)
 make blas       # BLAS acceleration (~30x faster)
 make mps        # Apple Silicon Metal GPU (fastest, macOS only)
+make cuda       # NVIDIA CUDA GPU (Linux; defaults to sm_86)
 ```
 
 **Recommended:**
 - macOS Apple Silicon: `make mps`
 - macOS Intel: `make blas`
+- Linux with a supported NVIDIA GPU: `make cuda`
 - Linux with OpenBLAS: `make blas`
 - Linux without OpenBLAS: `make generic`
 

@@ -22,8 +22,8 @@ LIB = libiris.a
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug lib install info test pngtest help generic blas mps
-.NOTPARALLEL: mps
+.PHONY: all clean debug lib install info test pngtest help generic blas mps cuda
+.NOTPARALLEL: mps cuda
 
 # Default: show available targets
 all: help
@@ -34,9 +34,10 @@ help:
 	@echo "Choose a backend:"
 	@echo "  make generic  - Pure C, no dependencies (slow)"
 	@echo "  make blas     - With BLAS acceleration (~30x faster)"
+	@echo "  make cuda     - NVIDIA GPU with CUDA acceleration (fastest on Linux)"
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
-	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
+	@echo "  make mps      - Apple Silicon with Metal GPU (fastest on Mac)"
 endif
 endif
 	@echo ""
@@ -110,6 +111,32 @@ mps:
 endif
 
 # =============================================================================
+# Backend: cuda (NVIDIA CUDA GPU)
+# =============================================================================
+CUDA_PATH ?= /opt/cuda
+NVCC ?= $(CUDA_PATH)/bin/nvcc
+CUDA_ARCH ?= sm_86
+CUDA_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -DUSE_CUDA -I/usr/include/openblas -I$(CUDA_PATH)/include
+CUDA_NVCCFLAGS = -O3 -arch=$(CUDA_ARCH) --use_fast_math -DUSE_CUDA -I. -I$(CUDA_PATH)/include -Xcompiler -fPIC
+CUDA_LDFLAGS = $(LDFLAGS) -L$(CUDA_PATH)/lib64 -lcublas -lcublasLt -lcudart -lopenblas -lstdc++
+
+cuda: clean cuda-build
+	@echo ""
+	@echo "Built with CUDA backend (NVIDIA GPU acceleration)"
+
+cuda-build: $(SRCS:.c=.cuda.o) $(CLI_SRCS:.c=.cuda.o) iris_cuda_kernels.o iris_cuda.o main.cuda.o
+	$(CC) $(CUDA_CFLAGS) -o $(TARGET) $^ $(CUDA_LDFLAGS)
+
+%.cuda.o: %.c iris.h iris_kernels.h iris_cuda.h
+	$(CC) $(CUDA_CFLAGS) -c -o $@ $<
+
+iris_cuda_kernels.o: iris_cuda_kernels.cu
+	$(NVCC) $(CUDA_NVCCFLAGS) -c -o $@ $<
+
+iris_cuda.o: iris_cuda.cu iris_cuda.h
+	$(NVCC) $(CUDA_NVCCFLAGS) -c -o $@ $<
+
+# =============================================================================
 # Build rules
 # =============================================================================
 $(TARGET): $(OBJS) $(CLI_OBJS) main.o
@@ -155,7 +182,7 @@ install: $(TARGET) $(LIB)
 	install -m 644 iris_kernels.h /usr/local/include/
 
 clean:
-	rm -f $(OBJS) $(CLI_OBJS) *.mps.o iris_metal.o main.o $(TARGET) $(LIB)
+	rm -f $(OBJS) $(CLI_OBJS) *.mps.o *.cuda.o iris_metal.o iris_cuda.o iris_cuda_kernels.o main.o main.mps.o main.cuda.o $(TARGET) $(LIB)
 	rm -f iris_shaders_source.h
 
 info:

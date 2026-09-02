@@ -34,6 +34,8 @@
 
 #ifdef USE_METAL
 #include "iris_metal.h"
+#elif defined(USE_CUDA)
+#include "iris_cuda.h"
 #endif
 
 #ifdef USE_BLAS
@@ -262,7 +264,7 @@ static void print_usage(const char *prog) {
  * ======================================================================== */
 
 int main(int argc, char *argv[]) {
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     iris_metal_init();
 #endif
 
@@ -376,13 +378,17 @@ int main(int argc, char *argv[]) {
     }
 
     /* BLAS: apply thread setting regardless of quiet mode */
-#if defined(USE_BLAS) && !defined(USE_METAL) && !defined(__APPLE__)
+#if defined(USE_BLAS) && !defined(USE_METAL) && !defined(USE_CUDA) && !defined(__APPLE__)
     if (blas_threads > 0) openblas_set_num_threads(blas_threads);
 #endif
 
     /* Backend banner (suppressed by --quiet) */
     if (output_level != OUTPUT_QUIET) {
-#ifdef USE_METAL
+#ifdef USE_CUDA
+        if (iris_cuda_available()) {
+            fprintf(stderr, "CUDA: NVIDIA GPU Acceleration Enabled\n");
+        }
+#elif defined(USE_METAL)
         if (iris_metal_available()) {
             long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
             char cpu_brand[128] = "Apple Silicon";
@@ -728,7 +734,7 @@ int main(int argc, char *argv[]) {
     iris_image_free(output);
     iris_free(ctx);
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     iris_metal_cleanup();
 #endif
 

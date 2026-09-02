@@ -29,6 +29,8 @@
 /* Use Metal for GPU acceleration */
 #ifdef USE_METAL
 #include "iris_metal.h"
+#elif defined(USE_CUDA)
+#include "iris_cuda.h"
 #endif
 
 /* Minimum matrix size for GPU acceleration.
@@ -140,7 +142,7 @@ struct qwen3_model {
 /* Forward declarations for mmap streaming mode */
 static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
                               int num_files, int layer_idx);
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
 static int load_layer_weights_small_f32(qwen3_layer_t *layer, safetensors_file_t **files,
                                         int num_files, int layer_idx);
 static int load_layer_weights_bf16(qwen3_layer_t *layer, safetensors_file_t **files,
@@ -155,7 +157,7 @@ static void free_layer_weights(qwen3_layer_t *layer);
 static void qwen3_linear(float *y, const float *x, const float *W,
                          int seq_len, int in_dim, int out_dim) {
     /* y[seq, out] = x[seq, in] @ W[out, in]^T */
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Use GPU for large matrices */
     size_t matrix_elements = (size_t)seq_len * out_dim;
     if (iris_metal_available() && matrix_elements >= QWEN3_MIN_GPU_ELEMENTS) {
@@ -356,7 +358,7 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
     apply_rope(model->q_buf, model->k_buf, model->rope_cos, model->rope_sin,
                seq_len, num_heads, num_kv_heads, head_dim);
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Try GPU-accelerated causal attention for all heads in parallel.
      * The GPU kernel uses both causal masking and attention mask.
      * This ensures exact parity with CPU implementation. */
@@ -452,7 +454,7 @@ static void qwen3_attention_forward(qwen3_model_t *model, qwen3_layer_t *layer,
 
     /* Work buffers are pre-allocated in model, no free needed */
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
 output_proj:
 #endif
     /* Output projection */
@@ -528,7 +530,7 @@ static void qwen3_layer_forward(qwen3_model_t *model, qwen3_layer_t *layer,
     }
 }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
 /* ========================================================================
  * BF16 GPU-Accelerated Layer Forward
  * Uses GPU for linear layers, keeps attention/norm on CPU for simplicity.
@@ -1090,7 +1092,7 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
     }
 
     /* Run through transformer layers */
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Try fully GPU-resident path: 1 sync instead of 72, skips unneeded layers */
     if (model->use_bf16 && iris_metal_available() && seq_len <= 512) {
         if (qwen3_forward_gpu(model, seq_len, attention_mask))
@@ -1109,12 +1111,12 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
     for (int layer_idx = 0; layer_idx <= last_layer; layer_idx++) {
         /* In mmap mode, load layer weights on-demand */
         if (model->use_mmap) {
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
             if (model->use_bf16) {
                 /* Load only small f32 weights (layer norms) + bf16 projection weights */
                 if (load_layer_weights_small_f32(&model->layers[layer_idx], model->sf_files, model->num_sf_files, layer_idx) != 0) {
                     fprintf(stderr, "Failed to load layer %d small weights\n", layer_idx);
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
                     if (batch_mode) iris_gpu_batch_end();
 #endif
                     return NULL;
@@ -1130,7 +1132,7 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
             }
         }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
         if (model->use_bf16 && iris_metal_available()) {
             qwen3_layer_forward_bf16(model, &model->layers[layer_idx], seq_len, attention_mask);
         } else
@@ -1162,7 +1164,7 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
             iris_text_progress_callback(layer_idx, model->num_layers);
     }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* End batch mode */
     if (batch_mode) {
         iris_gpu_batch_end();
@@ -1170,7 +1172,7 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
 #endif
 
     /* Build output embeddings */
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
 concatenate: (void)0; /* label needs a statement; can't precede a declaration in C */
 #endif
     int text_dim = model->text_dim;
@@ -1214,7 +1216,7 @@ static float *load_tensor(safetensors_file_t **files, int num_files, const char 
     return NULL;
 }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
 /* Helper to load bf16 tensor directly (zero-copy from mmap region) */
 static uint16_t *load_tensor_bf16(safetensors_file_t **files, int num_files, const char *name) {
     for (int f = 0; f < num_files; f++) {
@@ -1306,7 +1308,7 @@ static int load_layer_weights(qwen3_layer_t *layer, safetensors_file_t **files,
     return 0;
 }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
 /* Load bf16 weights for a layer (GPU acceleration path).
  * Returns 1 if all bf16 weights loaded successfully, 0 otherwise.
  * bf16 pointers are direct into mmap region - do NOT free them. */
@@ -1354,6 +1356,26 @@ static int load_layer_weights_bf16(qwen3_layer_t *layer, safetensors_file_t **fi
 
 /* Free a single layer's weights (used in mmap streaming mode) */
 static void free_layer_weights(qwen3_layer_t *layer) {
+#ifdef USE_CUDA
+    /* These mmap-backed pointers become invalid as soon as the layer struct is
+     * cleared.  Remove their device copies individually, after queued work. */
+    iris_cuda_invalidate_weight(layer->attn.q_proj_weight_bf16);
+    iris_cuda_invalidate_weight(layer->attn.k_proj_weight_bf16);
+    iris_cuda_invalidate_weight(layer->attn.v_proj_weight_bf16);
+    iris_cuda_invalidate_weight(layer->attn.o_proj_weight_bf16);
+    iris_cuda_invalidate_weight(layer->attn.q_norm_weight_bf16);
+    iris_cuda_invalidate_weight(layer->attn.k_norm_weight_bf16);
+    iris_cuda_invalidate_weight(layer->mlp.gate_proj_weight_bf16);
+    iris_cuda_invalidate_weight(layer->mlp.up_proj_weight_bf16);
+    iris_cuda_invalidate_weight(layer->mlp.down_proj_weight_bf16);
+    iris_cuda_invalidate_weight(layer->attn.q_proj_weight);
+    iris_cuda_invalidate_weight(layer->attn.k_proj_weight);
+    iris_cuda_invalidate_weight(layer->attn.v_proj_weight);
+    iris_cuda_invalidate_weight(layer->attn.o_proj_weight);
+    iris_cuda_invalidate_weight(layer->mlp.gate_proj_weight);
+    iris_cuda_invalidate_weight(layer->mlp.up_proj_weight);
+    iris_cuda_invalidate_weight(layer->mlp.down_proj_weight);
+#endif
     free(layer->input_layernorm_weight);
     free(layer->post_attention_layernorm_weight);
     free(layer->attn.q_proj_weight);
@@ -1649,7 +1671,7 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
         qwen3_set_defaults(model);
     }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Enable bf16 GPU acceleration when Metal is available.
      * Set IRIS_QWEN3_NO_BF16=1 to disable for debugging. */
     model->use_bf16 = (iris_metal_available() && !getenv("IRIS_QWEN3_NO_BF16")) ? 1 : 0;

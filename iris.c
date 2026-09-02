@@ -17,6 +17,8 @@
 
 #ifdef USE_METAL
 #include "iris_metal.h"
+#elif defined(USE_CUDA)
+#include "iris_cuda.h"
 #endif
 
 /* ========================================================================
@@ -532,7 +534,7 @@ void iris_release_text_encoder(iris_ctx *ctx) {
     qwen3_encoder_free(ctx->qwen3_encoder);
     ctx->qwen3_encoder = NULL;
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Reset all GPU state to ensure clean slate for transformer.
      * This clears weight caches, activation pools, and pending commands. */
     iris_metal_reset();

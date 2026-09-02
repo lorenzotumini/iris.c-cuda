@@ -89,9 +89,10 @@ static double tf_get_time_ms(void) {
 /* Use Metal for GPU acceleration when available */
 #ifdef USE_METAL
 #include "iris_metal.h"
+#elif defined(USE_CUDA)
+#include "iris_cuda.h"
 #endif
 
-/* Enable BF16 pipeline debug logging when IRIS_BF16_DEBUG is set. */
 #ifdef USE_METAL
 static int bf16_debug_enabled(void) {
     static int enabled = -1;
@@ -621,7 +622,39 @@ static int load_double_block_weights(double_block_t *b, safetensors_file_t **fil
 /* Free weights for a single double_block (mmap mode only)
  * Note: bf16 pointers are direct mmap pointers, don't free them */
 static void free_double_block_weights(double_block_t *b) {
-#ifdef USE_METAL
+#ifdef USE_CUDA
+    /* Queue per-weight eviction after this block's work.  Flushing the entire
+     * CUDA cache here serialized every block and also discarded RoPE/input
+     * weights that are safe to retain. */
+    iris_cuda_invalidate_weight(b->img_q_weight_bf16);
+    iris_cuda_invalidate_weight(b->img_k_weight_bf16);
+    iris_cuda_invalidate_weight(b->img_v_weight_bf16);
+    iris_cuda_invalidate_weight(b->img_proj_weight_bf16);
+    iris_cuda_invalidate_weight(b->img_mlp_gate_weight_bf16);
+    iris_cuda_invalidate_weight(b->img_mlp_up_weight_bf16);
+    iris_cuda_invalidate_weight(b->img_mlp_down_weight_bf16);
+    iris_cuda_invalidate_weight(b->txt_q_weight_bf16);
+    iris_cuda_invalidate_weight(b->txt_k_weight_bf16);
+    iris_cuda_invalidate_weight(b->txt_v_weight_bf16);
+    iris_cuda_invalidate_weight(b->txt_proj_weight_bf16);
+    iris_cuda_invalidate_weight(b->txt_mlp_gate_weight_bf16);
+    iris_cuda_invalidate_weight(b->txt_mlp_up_weight_bf16);
+    iris_cuda_invalidate_weight(b->txt_mlp_down_weight_bf16);
+    iris_cuda_invalidate_weight(b->img_q_weight);
+    iris_cuda_invalidate_weight(b->img_k_weight);
+    iris_cuda_invalidate_weight(b->img_v_weight);
+    iris_cuda_invalidate_weight(b->img_proj_weight);
+    iris_cuda_invalidate_weight(b->img_mlp_gate_weight);
+    iris_cuda_invalidate_weight(b->img_mlp_up_weight);
+    iris_cuda_invalidate_weight(b->img_mlp_down_weight);
+    iris_cuda_invalidate_weight(b->txt_q_weight);
+    iris_cuda_invalidate_weight(b->txt_k_weight);
+    iris_cuda_invalidate_weight(b->txt_v_weight);
+    iris_cuda_invalidate_weight(b->txt_proj_weight);
+    iris_cuda_invalidate_weight(b->txt_mlp_gate_weight);
+    iris_cuda_invalidate_weight(b->txt_mlp_up_weight);
+    iris_cuda_invalidate_weight(b->txt_mlp_down_weight);
+#elif defined(USE_METAL)
     /* Invalidate GPU weight cache before freeing CPU pointers.
      * malloc can reuse freed addresses, causing stale cache hits. */
     iris_metal_clear_weight_cache_only();
@@ -693,7 +726,12 @@ static int load_single_block_weights(single_block_t *b, safetensors_file_t **fil
 /* Free weights for a single single_block (mmap mode only)
  * Note: bf16 pointers are direct mmap pointers, don't free them */
 static void free_single_block_weights(single_block_t *b) {
-#ifdef USE_METAL
+#ifdef USE_CUDA
+    iris_cuda_invalidate_weight(b->qkv_mlp_weight_bf16);
+    iris_cuda_invalidate_weight(b->proj_mlp_weight_bf16);
+    iris_cuda_invalidate_weight(b->qkv_mlp_weight);
+    iris_cuda_invalidate_weight(b->proj_mlp_weight);
+#elif defined(USE_METAL)
     iris_metal_clear_weight_cache_only();
 #endif
     free(b->norm_q_weight); b->norm_q_weight = NULL;
@@ -1341,7 +1379,7 @@ static void apply_qk_norm(float *q, float *k,
 
 /* Multi-head self-attention */
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
 /* Transpose from [seq, heads, head_dim] to [heads, seq, head_dim]
  * Needed for batched attention that processes each head separately */
 static void transpose_shd_to_hsd(float *out, const float *in,
@@ -1580,7 +1618,7 @@ static void mha_forward(float *out, const float *q, const float *k, const float 
     float scale = 1.0f / sqrtf((float)head_dim);
     (void)heads; /* hidden = heads * head_dim, but we use tf->hidden_size */
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Try fused attention kernel first - operates directly on [seq, hidden] layout
      * This avoids CPU transpose overhead */
     if (iris_metal_attention_fused(out, q, k, v, seq, seq, tf->num_heads, head_dim, scale)) {
@@ -1693,7 +1731,7 @@ static void joint_attention(float *img_out, float *txt_out,
     memcpy(cat_k + txt_seq * hidden, img_k, img_seq * hidden * sizeof(float));
     memcpy(cat_v + txt_seq * hidden, img_v, img_seq * hidden * sizeof(float));
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Try fused attention kernel first - operates directly on [seq, hidden] layout
      * This avoids CPU transpose overhead */
     if (iris_metal_attention_fused(img_out, img_q, cat_k, cat_v,
@@ -1810,7 +1848,7 @@ static void joint_attention(float *img_out, float *txt_out,
 #endif
 }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
 static iris_gpu_tensor_t bf16_tensor_from_f32(const float *data, int n) {
     iris_gpu_tensor_t f32 = iris_gpu_tensor_create(data, n);
     if (!f32) return NULL;
@@ -2341,7 +2379,7 @@ static void double_block_forward(float *img_hidden, float *txt_hidden,
  * Single-Stream Block (Parallel DiT)
  * ======================================================================== */
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
 /* GPU-optimized single block forward using persistent GPU tensors
  * Keeps activations on GPU throughout the block to minimize memory transfers.
  * Returns 1 if GPU path was used, 0 to fall back to CPU path.
@@ -2720,7 +2758,7 @@ static int single_block_forward_gpu_chained(iris_gpu_tensor_t hidden_gpu,
         iris_gpu_tensor_read(v_gpu, v_cpu);
         float *attn_out_cpu = tf->single_attn_out;
         mha_forward(attn_out_cpu, q_cpu, k_cpu, v_cpu, seq, heads, head_dim, tf);
-        memcpy(iris_gpu_tensor_data(attn_out_gpu), attn_out_cpu, seq * h_size * sizeof(float));
+        iris_gpu_tensor_write(attn_out_gpu, attn_out_cpu);
     }
 
     /* === Phase 9: SwiGLU on GPU === */
@@ -2751,7 +2789,7 @@ static int single_block_forward_gpu_chained(iris_gpu_tensor_t hidden_gpu,
             float *hidden_cpu = tf->work2;  /* Reuse work2 since mod_params is done */
             iris_gpu_tensor_read(hidden_gpu, hidden_cpu);
             gated_add(hidden_cpu, gate, proj_out_cpu, seq, h_size);
-            memcpy(iris_gpu_tensor_data(hidden_gpu), hidden_cpu, seq * h_size * sizeof(float));
+            iris_gpu_tensor_write(hidden_gpu, hidden_cpu);
             goto cleanup;
         }
     }
@@ -3037,7 +3075,7 @@ static float *iris_transformer_forward_bf16_flux(iris_transformer_flux_t *tf,
                                             const float *t_emb,
                                             const float *img_rope_cos, const float *img_rope_sin,
                                             const float *txt_rope_cos, const float *txt_rope_sin) {
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     iris_metal_rope_cache_begin();
 #endif
     int hidden = tf->hidden_size;
@@ -3535,7 +3573,7 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
         }
     }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* With direct mmap pointers, the bf16 pipeline now works correctly in mmap mode.
      * Cache entries are stable (pointers point into mmap region) so no collision. */
     if (iris_metal_available() && iris_bf16_pipeline_available() && tf->use_bf16) {
@@ -3655,7 +3693,7 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
     /* Single-stream blocks */
     double single_start = tf_get_time_ms();
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Try BF16 native path first */
     int bf16_path_ok = 0;
     int gpu_chained_ok = 0;
@@ -3837,7 +3875,7 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
                 load_single_block_weights(&tf->single_blocks[i], tf->sf_files, tf->num_sf_files, i,
                                           tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
             }
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
             /* Try GPU-optimized path first */
             if (!single_block_forward_gpu(concat_hidden, &tf->single_blocks[i],
                                           t_emb, tf->adaln_single_weight,
@@ -3867,7 +3905,7 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
             }
 #endif
         }
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     }
 #endif
 
@@ -3935,7 +3973,7 @@ float *iris_transformer_forward_flux(iris_transformer_flux_t *tf,
     if (iris_substep_callback)
         iris_substep_callback(IRIS_SUBSTEP_FINAL_LAYER, 0, 1);
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Ensure all GPU operations complete before returning.
      * This prevents issues where subsequent denoising steps
      * start before previous step's GPU work is fully done. */
@@ -4032,7 +4070,7 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
         }
     }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Try BF16 GPU-accelerated path for img2img.
      * Pass combined_img_seq as img_seq (full sequence including reference),
      * but only extract img_seq (target) tokens at the end. */
@@ -4160,7 +4198,7 @@ float *iris_transformer_forward_refs_flux(iris_transformer_flux_t *tf,
     if (iris_substep_callback)
         iris_substep_callback(IRIS_SUBSTEP_FINAL_LAYER, 0, 1);
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     iris_gpu_sync();
 #endif
 
@@ -4276,7 +4314,7 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
         trans_offset += ref_seq;
     }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Try BF16 GPU-accelerated path for multi-ref img2img. */
     if (iris_metal_available() && iris_bf16_pipeline_available() && tf->use_bf16) {
         float *bf16_output = iris_transformer_forward_bf16_flux(tf, combined_transposed, combined_img_seq,
@@ -4404,7 +4442,7 @@ float *iris_transformer_forward_multirefs_flux(iris_transformer_flux_t *tf,
     if (iris_substep_callback)
         iris_substep_callback(IRIS_SUBSTEP_FINAL_LAYER, 0, 1);
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     iris_gpu_sync();
 #endif
 
@@ -4822,7 +4860,7 @@ iris_transformer_flux_t *iris_transformer_load_safetensors_flux(const char *mode
     }
 
     /* Enable bf16 mode if Metal GPU is available */
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     tf->use_bf16 = iris_metal_available();
     if (tf->use_bf16) {
         if (iris_verbose)
@@ -5074,7 +5112,7 @@ iris_transformer_flux_t *iris_transformer_load_safetensors_mmap_flux(const char 
     }
 
     /* Enable bf16 mode if Metal GPU is available */
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     tf->use_bf16 = iris_metal_available();
     if (tf->use_bf16) {
         if (iris_verbose)

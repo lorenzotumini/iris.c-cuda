@@ -32,6 +32,8 @@
 
 #ifdef USE_METAL
 #include "iris_metal.h"
+#elif defined(USE_CUDA)
+#include "iris_cuda.h"
 #endif
 
 /* ========================================================================
@@ -84,7 +86,7 @@ typedef struct {
     float *adaln_weight;        /* [4*dim, adaln_dim] */
     float *adaln_bias;          /* [4*dim] */
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* BF16 weight pointers for GPU path (converted from f32 at load time) */
     uint16_t *attn_q_weight_bf16;   /* [dim, dim] */
     uint16_t *attn_k_weight_bf16;   /* [dim, dim] */
@@ -167,7 +169,7 @@ typedef struct zi_transformer {
     size_t work_alloc;          /* Total allocated */
     int max_seq;                /* Max sequence length allocated for */
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     int use_gpu;                /* 1 if GPU path available */
     /* Cached preassembled RoPE tables for GPU path (reused across steps) */
     int gpu_rope_img_seq;
@@ -186,7 +188,7 @@ typedef struct zi_transformer {
 
 void iris_transformer_free_zimage(zi_transformer_t *tf);
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
 /* GPU scratch buffers for block forward pass.
  * Pre-allocated once for max sequence length, reused across all blocks. */
 typedef struct {
@@ -485,6 +487,7 @@ static int zi_gpu_rope_cache_prepare(zi_transformer_t *tf,
     return 1;
 }
 
+#ifdef USE_METAL
 static void iris_warmup_bf16_zimage(zi_transformer_t *tf) {
     if (!tf || !tf->use_gpu) return;
     if (!iris_metal_available()) return;
@@ -517,6 +520,25 @@ static void iris_warmup_bf16_zimage(zi_transformer_t *tf) {
         }
     }
 }
+#endif
+
+#ifdef USE_CUDA
+/* Z-Image's weights are larger than an 8 GB GPU.  Keep only the current
+ * block resident: cudaFreeAsync preserves stream ordering, so invalidating a
+ * cache entry here cannot race the kernels that just consumed it. */
+static void zi_cuda_invalidate_block_weights(const zi_block_t *block) {
+    if (!block) return;
+    iris_cuda_invalidate_weight(block->attn_q_weight_bf16);
+    iris_cuda_invalidate_weight(block->attn_k_weight_bf16);
+    iris_cuda_invalidate_weight(block->attn_v_weight_bf16);
+    iris_cuda_invalidate_weight(block->attn_qkv_weight_bf16);
+    iris_cuda_invalidate_weight(block->attn_out_weight_bf16);
+    iris_cuda_invalidate_weight(block->ffn_w1_bf16);
+    iris_cuda_invalidate_weight(block->ffn_w2_bf16);
+    iris_cuda_invalidate_weight(block->ffn_w3_bf16);
+    iris_cuda_invalidate_weight(block->ffn_w13_weight_bf16);
+}
+#endif
 #endif /* USE_METAL */
 
 /* ========================================================================
@@ -872,7 +894,7 @@ static void zi_block_forward(float *x, const zi_block_t *block,
  * GPU Forward Pass (Metal)
  * ======================================================================== */
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
 
 /* Convert f32 array to bf16 (CPU-side, for weight conversion at load time).
  * Uses round-to-nearest-even for best accuracy.
@@ -1394,6 +1416,9 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
         gpu_ok = zi_block_forward_gpu(img_gpu, &tf->noise_refiner[i],
                                        img_rope_cos, img_rope_sin,
                                        t_emb, block_mod, img_seq, tf, &scratch);
+#ifdef USE_CUDA
+        zi_cuda_invalidate_block_weights(&tf->noise_refiner[i]);
+#endif
         if (gpu_ok && iris_substep_callback)
             iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, i, refiner_total);
     }
@@ -1405,6 +1430,9 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
         gpu_ok = zi_block_forward_gpu(cap_gpu, &tf->context_refiner[i],
                                        cap_rope_cos, cap_rope_sin,
                                        NULL, NULL, cap_seq_len, tf, &scratch);
+#ifdef USE_CUDA
+        zi_cuda_invalidate_block_weights(&tf->context_refiner[i]);
+#endif
         if (gpu_ok && iris_substep_callback)
             iris_substep_callback(IRIS_SUBSTEP_DOUBLE_BLOCK, tf->n_refiner + i, refiner_total);
     }
@@ -1448,6 +1476,9 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
         gpu_ok = zi_block_forward_gpu(unified_gpu, &tf->layers[i],
                                        uni_rope_cos, uni_rope_sin,
                                        t_emb, block_mod, unified_seq, tf, &scratch);
+#ifdef USE_CUDA
+        zi_cuda_invalidate_block_weights(&tf->layers[i]);
+#endif
         if (gpu_ok && iris_substep_callback)
             iris_substep_callback(IRIS_SUBSTEP_SINGLE_BLOCK, i, tf->n_layers);
     }
@@ -1523,8 +1554,7 @@ static float *zi_transformer_forward_gpu(zi_transformer_t *tf,
         free(final_scale);
         return NULL;
     }
-    float *final_out_data = iris_gpu_tensor_data(final_out_gpu);
-    memcpy(final_out, final_out_data, (size_t)img_seq * out_ch * sizeof(float));
+    iris_gpu_tensor_read(final_out_gpu, final_out);
     iris_gpu_tensor_free(final_out_gpu);
     for (int s = 0; s < img_seq; s++) {
         for (int i = 0; i < out_ch; i++) {
@@ -1697,7 +1727,7 @@ float *iris_transformer_forward_zimage(zi_transformer_t *tf,
                                 float timestep,
                                 const float *cap_feats,
                                 int cap_seq_len) {
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Try GPU-accelerated path first */
     if (tf->use_gpu) {
         float *result = zi_transformer_forward_gpu(tf, latent, latent_h, latent_w,
@@ -2083,7 +2113,7 @@ static int zi_load_block(zi_block_t *block, safetensors_file_t **files,
         return 0;
     }
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Convert large weight matrices to bf16 for GPU path */
     if (use_gpu) {
         size_t attn_mat_elems = (size_t)dim * dim;
@@ -2140,7 +2170,7 @@ static void zi_free_block(zi_block_t *block, int free_f32_weights) {
         free(block->adaln_weight);
         free(block->adaln_bias);
     }
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     free(block->attn_q_weight_bf16);
     free(block->attn_k_weight_bf16);
     free(block->attn_v_weight_bf16);
@@ -2285,7 +2315,7 @@ zi_transformer_t *zi_transformer_load_safetensors(const char *model_dir,
 
     /* Check if GPU acceleration is available */
     int use_gpu = 0;
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     if (iris_metal_available() && iris_metal_shaders_available()) {
         use_gpu = 1;
         tf->use_gpu = 1;
@@ -2486,7 +2516,7 @@ void iris_transformer_free_zimage(zi_transformer_t *tf) {
     free(tf->work_attn);
     free(tf->work_ffn);
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     zi_gpu_rope_cache_clear(tf);
 #endif
 

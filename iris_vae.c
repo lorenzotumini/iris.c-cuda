@@ -16,6 +16,8 @@
 #include "iris_safetensors.h"
 #ifdef USE_METAL
 #include "iris_metal.h"
+#elif defined(USE_CUDA)
+#include "iris_cuda.h"
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -131,7 +133,7 @@ static void vae_conv2d(float *out, const float *in,
                        const float *weight, const float *bias,
                        int batch, int in_ch, int out_ch, int H, int W,
                        int kH, int kW, int stride, int padding) {
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     if (!iris_metal_available()) {
         iris_metal_init();
     }
@@ -470,7 +472,7 @@ float *iris_vae_encode(iris_vae_t *vae, const float *img,
  * GPU-Resident Decoder
  * ======================================================================== */
 
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
 
 /* GPU resblock: all operations on GPU, returns new tensor */
 static iris_gpu_tensor_t resblock_forward_gpu(iris_gpu_tensor_t x,
@@ -734,7 +736,7 @@ static iris_image *vae_decode_gpu(iris_vae_t *vae, const float *latent,
  * falling back to CPU on failure. */
 iris_image *iris_vae_decode(iris_vae_t *vae, const float *latent,
                             int batch, int latent_h, int latent_w) {
-#ifdef USE_METAL
+#if defined(USE_METAL) || defined(USE_CUDA)
     /* Try GPU-resident path first (eliminates CPU<->GPU round-trips per conv) */
     if (iris_metal_available()) {
         iris_image *gpu_result = vae_decode_gpu(vae, latent, batch, latent_h, latent_w);
